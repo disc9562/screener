@@ -13,3 +13,4 @@ APScheduler
 python-dotenv
 ccxt
 TA-Lib
+

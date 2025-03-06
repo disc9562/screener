@@ -1,295 +1,208 @@
-"""
-20230504
-This script includes functions to download stock market data and crypto from multiple sources
-"""
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pytz import timezone
+import pandas as pd
+import pytz
+import json
+import re
+from stocksymbol import StockSymbol
+from polygon import RESTClient
+from urllib3.util.retry import Retry
+from binance import Client
+from pathlib import Path
 import os
 import time
-import pandas as pd
-import yfinance as yf
-import requests
-import pytz
-from pathlib import Path
-from stocksymbol import StockSymbol
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter, Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from binance import Client
-from tenacity import *
 
-from src.utils import read_tokens, read_tradingview_csv, get_closest_market_datetime, check_timezone_to_ny, connect_db
-
-
-###########################################################################
+# Configurable SMA periods
 STOCK_SMA = [20, 30, 45, 50, 60, 150, 200]
 CRYPTO_SMA = [30, 45, 60]
-REQUEST_STOCK_TIINGO_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices?startDate={start_date_str}&endDate={end_date_str}&format=json"
-REQUEST_CRYPTO_TIINGO_URL = "https://api.tiingo.com/tiingo/crypto/prices?tickers={crypto}&startDate={start_date_str}&endDate={end_date_str}&resampleFreq={interval}"
-DB_STRFTIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-INCLUDE_STOCK_SYMBOLS = ["SPY", "QQQ", "DIA"]
-###########################################################################
 
 
-class BaseDownloader:
-    def __init__(self, api_keys: dict = None, save_dir: str = ".", db_name="screen.db"):
-        if not api_keys:
-            self.api_keys = read_tokens()
-        else:
-            self.api_keys = api_keys
+def parse_time_string(time_string):
+    pattern_with_number = r"(\d+)([mhdMHD])$"
+    pattern_without_number = r"([dD])$"
+    match_with_number = re.match(pattern_with_number, time_string)
+    match_without_number = re.match(pattern_without_number, time_string)
+
+    if match_with_number:
+        number = int(match_with_number.group(1))
+        unit = match_with_number.group(2)
+    elif match_without_number:
+        number = 1
+        unit = match_without_number.group(1)
+    else:
+        raise ValueError("Invalid time format. Only formats like '15m', '4h', 'd' are allowed.")
+
+    unit = unit.lower()
+    unit_match = {
+        "m": "minute",
+        "h": "hour",
+        "d": "day"
+    }
+    return number, unit_match[unit]
+
+
+class StockDownloader:
+    def __init__(self, save_dir: str = ".", api_file: str = "api_keys.json"):
+        with open(api_file) as f:
+            self.api_keys = json.load(f)
         self.save_dir = Path(save_dir)
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
-        self.db_path = self.save_dir / db_name
 
-
-class StockDownloader(BaseDownloader):
-    def __init__(self, api_keys: dict = None, save_dir: str = ".", db_name="screen.db"):
-        super().__init__(api_keys, save_dir, db_name)
-
-    def check_stock_table(self):
-        conn, cursor = connect_db(self.db_path)
-        try:
-            # Check if the information in database is available
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stock'")
-            existing_table = cursor.fetchone()
-            # Table doesn't exist, so create it
-            if not existing_table:
-                cursor.execute('''CREATE TABLE stock (
-                                   Stock TEXT,
-                                   Datetime DATETIME,
-                                   "Close Price" FLOAT,
-                                   "High Price" FLOAT,
-                                   "Low Price" FLOAT,
-                                   "Open Price" FLOAT,
-                                   "Adj Close" FLOAT,
-                                   Volume INTEGER,
-                                   SMA_20 FLOAT,
-                                   SMA_30 FLOAT,
-                                   SMA_45 FLOAT,
-                                   SMA_50 FLOAT, 
-                                   SMA_60 FLOAT,
-                                   SMA_150 FLOAT,
-                                   SMA_200 FLOAT,
-                                   PRIMARY KEY (Stock, Datetime)
-                                   )''')
-                print("Table \"stock\" doesn't exist. A new table has been created successfully.")
-
-        except Exception as e:
-            raise Exception(f"Failed to create the table \"stock\": {e}")
-
-        finally:
-            cursor.close()
-            conn.close()
-
-    def get_all_symbols(self, tradingview_csv="tradingview.csv", csv_column_name="Ticker"):
-        """
-        download all stock symbols from StockSymbol API to csv file and update the file every month
-        return:
-        """
-        saved_symbols_path = self.save_dir / "company-list.csv"
-        symbols_expired = False
-        if saved_symbols_path.exists():
-            # Obtain the file modification timestamp of a file
-            m_time = os.path.getmtime(saved_symbols_path)
-            # Obtain now timestamp
-            now = datetime.now()
-            # Find the timedelta between now and the file modification timestamp
-            delta = now - datetime.fromtimestamp(m_time)
-            if delta > timedelta(days=30):
-                symbols_expired = True
-
-        if not saved_symbols_path.exists() or symbols_expired:
-            tradingview_symbol_only_list = None
-            if os.path.exists(self.save_dir / tradingview_csv):
-                tradingview_symbol_only_list = read_tradingview_csv(self.save_dir / tradingview_csv, csv_column_name)
-            api_key = self.api_keys["stocksymbol"]
-            ss = StockSymbol(api_key)
-            # First we download all ticker in US market
-            symbol_only_list = ss.get_symbol_list(market="US", symbols_only=True)
-            # The first 2 rows are for discarding any tickers that is not stock
-            symbol_only_list = [x for x in symbol_only_list if "." not in x]
-            symbol_only_list = [i for i in symbol_only_list if len(i) <= 4]
-            if tradingview_symbol_only_list:
-                symbol_only_list = list(set(symbol_only_list) | set(tradingview_symbol_only_list))
-            symbol_only_list.sort()
-            # Convert the list to pandas dataframe
-            df = pd.DataFrame({'Symbol': symbol_only_list}, columns=['Symbol'])
-            # saving the dataframe as csv file
-            df.to_csv(saved_symbols_path, sep=' ', index=False)
-            return symbol_only_list
-        else:
-            data = pd.read_csv(saved_symbols_path, header=0)
-            return list(data.iloc[:, 0])
-
-    def update_database(self, start_date=(datetime.now() - timedelta(days=400)), end_date=datetime.now(),
-                        exclude_symbols=[], include_symbols=INCLUDE_STOCK_SYMBOLS):
-
-        def get_ticker_loop(ticker, start_d, end_d):
-            return self.get_ticker(ticker, start_d, end_d)
-
-        start_date = check_timezone_to_ny(start_date)
-        end_date = check_timezone_to_ny(end_date)
-        nearest_market_close_start_date = get_closest_market_datetime(start_date)
-        nearest_market_close_end_date = get_closest_market_datetime(end_date)
-        # Get all the symbols and submit jobs to executor pool
-        all_symbols = self.get_all_symbols()
-        filtered_symbols = sorted(list((set(all_symbols) - set(exclude_symbols)) | set(include_symbols)))
-        executor = ThreadPoolExecutor(max_workers=os.cpu_count()*2)
-        futures = []
-        for symbol in filtered_symbols:
-            print(f"Updating {symbol}...")
-            future = executor.submit(get_ticker_loop, symbol, nearest_market_close_start_date,
-                                     nearest_market_close_end_date)
-            futures.append(future)
-
-        success = []
-        fail = []
-        for future in as_completed(futures):
-            symbol, status, resp = future.result()
-            if status == 0:
-                fail.append((symbol, resp))
-            else:
-                success.append((symbol, resp))
-        executor.shutdown()
-
-        print(f"{len(success)} out of {len(filtered_symbols)} symbols have updated successfully -> ",
-              ", ".join([x[0] for x in success]))
-
-        if fail:
-            failed_symbols_dump_file = "failed_to_download_symbols_{}.txt".format(end_date.strftime("%Y-%m-%d"))
-            with open(str(self.save_dir / failed_symbols_dump_file), "w") as f:
-                for item in fail:
-                    f.write(f"{item[0]} failed -> {item[1]}\n")
-
-    def get_ticker(self, symbol, start_date, end_date):
-        start_date = check_timezone_to_ny(start_date)
-        end_date = check_timezone_to_ny(end_date)
-        status = 0  # 0 - fail, 1 - data from database, 2 - data from API
-        start_date = get_closest_market_datetime(start_date)
-        end_date = get_closest_market_datetime(end_date)
-        start_date_str = start_date.strftime("%Y-%m-%d")
-        end_date_str = end_date.strftime("%Y-%m-%d")
-
-        try:
-            conn, cursor = connect_db(self.db_path)
-        except Exception as e:
-            print(f"Failed to connect to the database: {e}")
-            response = str(e)
-            return symbol, status, response
-
-        try:
-            # Check if start date and end date are in the table already
-            cursor.execute("SELECT * FROM stock WHERE Datetime LIKE ? AND Stock = ?", (start_date_str + '%', symbol))
-            start_date_result = cursor.fetchall()
-            cursor.execute("SELECT * FROM stock WHERE Datetime LIKE ? AND Stock = ? ", (end_date_str + '%', symbol))
-            end_date_result = cursor.fetchall()
-            # If start date and end_date exist in the table, fetch data from database, otherwise fetch data from web
-            if start_date_result and end_date_result:
-                cursor.execute("SELECT * FROM stock WHERE date(Datetime) BETWEEN date(?) AND date(?) AND Stock = ?",
-                               (start_date_str, end_date_str, symbol))
-                rows = cursor.fetchall()
-                column_names = [description[0] for description in cursor.description]
-                response = pd.DataFrame(rows, columns=column_names)
-                status = 1
-                print(f"{symbol} -> Get data from database")
-            else:
-                try:
-                    response = self.request_tiingo(symbol, start_date, end_date)
-                    if response is None:
-                        response = self.request_yfinance(symbol, start_date, end_date)
-                except Exception as e:
-                    raise Exception(f"{symbol} -> Error in requesting data from web: {e}")
-                if response.empty:
-                    raise ValueError(f"{symbol} -> No stock data")
-                last_datetime_value = check_timezone_to_ny(datetime.strptime(response["Datetime"].values[-1], DB_STRFTIME_FORMAT))
-                if end_date - last_datetime_value >= timedelta(days=4):
-                    raise ValueError(f"{symbol} -> Symbol is off-market")
-
-                # store the data to sqlite3
-                response.insert(0, "Stock", symbol)
-                stored_columns = ['Stock', 'Datetime', 'Close Price', 'High Price', 'Low Price', 'Open Price',
-                                  'Adj Close', 'Volume', "SMA_20", "SMA_30", "SMA_45", "SMA_50", "SMA_60", "SMA_150",
-                                  "SMA_200"]
-                for col in response.columns:
-                    if not col in stored_columns:
-                        response = response.drop(columns=[col, ])
-                for _, row in response.iterrows():
-                    # Create a tuple with the values of the row
-                    columns = ', '.join(f'"{column}"' for column in stored_columns)
-                    values = ', '.join('?' for _ in row.index)
-                    # Generate the SQLite query to insert or replace the row
-                    query = f'INSERT OR REPLACE INTO stock ({columns}) VALUES ({values})'
-                    # Execute the query with the row values
-                    cursor.execute(query, tuple(row))
-                # Commit the changes to the database
-                conn.commit()
-                status = 2
-                print(f"{symbol} -> Successfully fetch data from web and store data to database")
-
-        except Exception as e:
-            print(f"{symbol} -> Error: {e}")
-            response = str(e)
-
-        finally:
-            cursor.close()
-            conn.close()
-        return symbol, status, response
-
-    @retry(stop=stop_after_attempt(3))
-    def request_yfinance(self, symbol, start_date, end_date):
-        start_date_str = start_date.strftime("%Y-%m-%d")
-        end_date = end_date + timedelta(days=1)
-        end_date_str = end_date.strftime("%Y-%m-%d")
-        try:
-            df = yf.download(symbol, start=start_date_str, end=end_date_str)
-            time.sleep(0.3)
-        except Exception as e:
-            raise Exception(f"{symbol} -> Fetching data from yfinance. Error: {e}")
-        df = df.reset_index()
-        df.rename(columns={"Date": "Datetime", "Open": "Open Price", "Close": "Close Price", "High": "High Price",
-                           "Low": "Low Price"}, inplace=True)
-        df["Datetime"] = pd.to_datetime(df["Datetime"]).dt.strftime(DB_STRFTIME_FORMAT)
-        for duration in STOCK_SMA:
-            df["SMA_" + str(duration)] = round(df.loc[:, "Adj Close"].rolling(window=duration).mean(), 2)
-        return df
-
-    def request_tiingo(self, symbol, start_date, end_date):
-        session = requests.Session()
-        retry = Retry(
-            total=1,
-            read=1,
-            connect=1,
-            backoff_factor=0.3,
-            status_forcelist=[500, 502, 504],
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[413, 429, 499, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST"],
+            raise_on_status=False,
+            respect_retry_after_header=True
         )
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Token {self.api_keys["tiingo"]}'
-        }
-        start_date_str = start_date.strftime("%Y-%m-%d")
-        end_date_str = end_date.strftime("%Y-%m-%d")
-        url = REQUEST_STOCK_TIINGO_URL.format(symbol=symbol, start_date_str=start_date_str, end_date_str=end_date_str)
-        response = session.get(url, headers=headers, timeout=30)
-        df = None
-        if response.status_code == 200:
-            data = response.json()
-            if not data:
-                return None
-            df = pd.DataFrame(data)
-            df.rename(columns={"date": "Datetime", "close": "Close Price", "high": "High Price", "low": "Low Price",
-                               "open": "Open Price", 'adjClose': 'Adj Close', 'volume': 'Abs Volume',
-                               'adjVolume': 'Volume', }, inplace=True)
-            df['Datetime'] = pd.to_datetime(df.Datetime).dt.strftime(DB_STRFTIME_FORMAT)  # change to datetime object
 
-            for duration in STOCK_SMA:
-                df["SMA_" + str(duration)] = round(df.loc[:, "Adj Close"].rolling(window=duration).mean(), 2)
-        return df
+        self.client = RESTClient(
+            api_key=self.api_keys["polygon"],
+            num_pools=5,
+            connect_timeout=10.0,
+            read_timeout=10.0,
+            retries=retry_strategy
+        )
 
-class CryptoDownloader(BaseDownloader):
-    def __init__(self, api_keys: dict = None, save_dir: str = ".", db_name="screen.db"):
-        super().__init__(api_keys, save_dir, db_name)
+    def _validate_data_quality(self, df: pd.DataFrame) -> bool:
+        """
+        Validate data quality
+        - Check if latest data is within a week
+        - Check for stale prices (same closing price for 10+ consecutive periods)
+        """
+        if df.empty:
+            return False
+
+        # Check data freshness
+        latest_ts = df['Datetime'].astype(int).max() / 1e9
+        week_ago = time.time() - (7 * 24 * 3600)
+        if latest_ts < week_ago:
+            return False
+
+        # Check for stale prices
+        consecutive_same_price = df['Close'].rolling(window=10).apply(
+            lambda x: len(set(x)) == 1
+        )
+        if consecutive_same_price.any():
+            return False
+
+        return True
+
+    def get_data(self, ticker: str, start_ts: int, timeframe: str = "1d") -> tuple[bool, pd.DataFrame]:
+        """
+        Get stock data with SMA calculation and data quality validation
+        Args:
+            ticker: Stock symbol
+            start_ts: Start timestamp
+            timeframe: Time interval ("1d" or "1h")
+        Returns:
+            (success, DataFrame)
+        """
+        # Calculate extended start for SMA calculation
+        max_sma = max(STOCK_SMA)
+        extension = max_sma * 24 * 3600 if timeframe == "1d" else max_sma * 7 * 3600
+        extended_start = start_ts - extension
+
+        # Get current time
+        end_ts = int(time.time())
+
+        # Parse timeframe
+        multiplier, timespan = parse_time_string(timeframe)
+
+        # Request data from Polygon
+        aggs = self.client.list_aggs(
+            ticker,
+            multiplier,
+            timespan,
+            from_=extended_start * 1000,
+            to=end_ts * 1000,
+            limit=50000
+        )
+
+        if not aggs:
+            return False, pd.DataFrame()
+
+        # Convert to DataFrame
+        df = pd.DataFrame([{
+            'Datetime': pd.Timestamp.fromtimestamp(agg.timestamp // 1000, tz=pytz.UTC),
+            'Open': float(agg.open),
+            'Close': float(agg.close),
+            'High': float(agg.high),
+            'Low': float(agg.low),
+            'Volume': float(agg.volume)
+        } for agg in aggs])
+
+        if df.empty:
+            return False, df
+
+        # Convert timezone and sort
+        df['Datetime'] = df['Datetime'].dt.tz_convert('America/New_York')
+        df = df.sort_values('Datetime')
+
+        # Filter market hours (9:00 AM - 4:00 PM NY time)
+        if timespan == "hour":
+            df = df[
+                df['Datetime'].dt.time.between(
+                    pd.to_datetime('09:00').time(),
+                    pd.to_datetime('16:00').time(),
+                    inclusive='left'
+                )
+            ]
+        elif timespan == "minute":
+            df = df[
+                df['Datetime'].dt.time.between(
+                    pd.to_datetime('09:30').time(),
+                    pd.to_datetime('16:00').time(),
+                    inclusive='left'
+                )
+            ]
+
+        # Validate data quality
+        if not self._validate_data_quality(df):
+            return False, pd.DataFrame()
+
+        # Calculate SMAs
+        for period in STOCK_SMA:
+            df[f'SMA_{period}'] = df['Close'].rolling(window=period).mean()
+
+        # Drop rows with NaN values
+        df = df.dropna()
+
+        # Filter to requested time range and reset index
+        df = df[df['Datetime'].astype(int) / 1e9 >= start_ts]
+        df = df.reset_index(drop=True)
+
+        return True, df
+
+    def get_all_tickers(self):
+        """Get all stock symbols from both StockSymbol and Polygon"""
+        # Get symbols from StockSymbol
+        ss = StockSymbol(self.api_keys["stocksymbol"])
+        stock_symbol_list = [x for x in ss.get_symbol_list(market="US", symbols_only=True)
+                           if "." not in x]
+
+        # Get symbols from Polygon
+        polygon_stocks = self.client.list_tickers(
+            market="stocks",
+            type="CS",
+            active=True,
+            limit=1000
+        )
+        polygon_common_stocks = [ticker.ticker for ticker in polygon_stocks]
+
+        # Merge and return unique symbols
+        all_symbols = sorted(set(stock_symbol_list).union(set(polygon_common_stocks)))
+        print(f"Found {len(all_symbols)} unique stock symbols")
+        return all_symbols
+
+
+class CryptoDownloader:
+    def __init__(self):
         self.binance_client = Client(requests_params={"timeout": 300})
 
     def get_all_symbols(self):
@@ -304,117 +217,7 @@ class CryptoDownloader(BaseDownloader):
                 binance_symbols.add(symbol_name)
         return list(binance_symbols)
 
-    def check_crypto_table(self):
-        conn, cursor = connect_db(self.db_path)
-        try:
-            # Check if the information in database is available
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='crypto'")
-            existing_table = cursor.fetchone()
-            # Table doesn't exist, so create it
-            if not existing_table:
-                cursor.execute('''CREATE TABLE crypto (
-                                   CRYPTO TEXT,
-                                   Datetime DATETIME,
-                                   "Close Price" FLOAT,
-                                   "High Price" FLOAT,
-                                   "Low Price" FLOAT,
-                                   "Open Price" FLOAT,
-                                   Volume FLOAT,
-                                   PRIMARY KEY (CRYPTO, Datetime)
-                                   )''')
-                print("Table \"crypto\" doesn't exist. A new table has been created successfully.")
-
-        except Exception as e:
-            raise Exception(f"Failed to create the table \"crypto\": {e}")
-
-        finally:
-            cursor.close()
-            conn.close()
-
-    def update_database(self, start_date=(datetime.now() - timedelta(days=60))):
-        def get_crypto_loop(s, start_d):
-            return self.get_crypto(s, start_d)
-
-        # Get all the symbols and submit jobs to executor pool
-        all_symbols = self.get_all_symbols()
-        executor = ThreadPoolExecutor(max_workers=os.cpu_count()*2)
-        futures = []
-        for symbol in all_symbols:
-            print(f"Updating {symbol}...")
-            future = executor.submit(get_crypto_loop, symbol, start_date)
-            futures.append(future)
-
-        success = []
-        fail = []
-        for future in as_completed(futures):
-            symbol, status, resp = future.result()
-            if status == 0:
-                fail.append((symbol, resp))
-            else:
-                success.append((symbol, resp))
-        executor.shutdown()
-
-        print(f"{len(success)} out of {len(all_symbols)} symbols have updated successfully -> ",
-              ", ".join([x[0] for x in success]))
-
-        if fail:
-            failed_symbols_dump_file = "failed_to_download_cryptos_{}.txt".format(datetime.now().strftime("%Y-%m-%d"))
-            with open(str(self.save_dir / failed_symbols_dump_file), "w") as f:
-                for item in fail:
-                    f.write(f"{item[0]} failed -> {item[1]}\n")
-
-    def get_crypto(self, crypto, time_interval="15m", timezone="America/Los_Angeles"):
-        status = 0  # 0 - fail, 1 - data from database
-        try:
-            binance_df = self.request_binance(crypto, time_interval, timezone)
-            binance_df.set_index('Datetime', inplace=True)
-            binance_df = binance_df[~binance_df.index.duplicated(keep='first')]
-            response = binance_df
-            response.reset_index(inplace=True)
-            for duration in CRYPTO_SMA:
-                response["SMA_" + str(duration)] = round(response.loc[:, "Close Price"].rolling(window=duration).mean(), 20)
-            status = 1
-            print(f"{crypto} -> Get data from binance successfully ({response.iloc[0]['Datetime']} to {response.iloc[-1]['Datetime']})")
-        except Exception as e:
-            print(f"{crypto} -> Error: {e}")
-            response = str(e)
-        return crypto, status, response
-    
-    def get_futures_top(self, num):
-        top_num = num + 2
-        top_10_quoteVolume = []
-        try:
-            time.sleep(65)
-            futures_all = self.binance_client.futures_ticker()
-            sorted_data = sorted(futures_all, key=lambda x: float(x['quoteVolume']), reverse=True)
-            top_10_quoteVolume_symbol =  [d['symbol'] for d in sorted_data[:top_num]]
-            for symbol in top_10_quoteVolume_symbol:
-                if 'BTC' not in symbol or 'ETH' not in symbol:
-                    top_10_quoteVolume.append(symbol.split('USDT')[0])
-            print(top_10_quoteVolume)
-        except Exception as e:
-            print("can't get futures data")
-
-        return top_10_quoteVolume
-    
-    def find_important_crypto_targets(self, top_10, strong_targets):
-        import_targets = [element for element in top_10 if element in strong_targets]
-        return import_targets
-
-    def write_targets_file(self, date, targets: dict):
-        file_str = ""
-        for k,v in targets.items():
-            file_str += f"###{k},"
-            for crypto in v:
-                if "BUSD" not in crypto:
-                    file_str = file_str + "BINANCE:" + crypto + "USDT.P,"
-                else:
-                    file_str = file_str + "BINANCE:" + crypto + ".P,"
-
-        with open(f"{date}_標的.txt", "w", encoding="utf-8") as file:
-            file.write(file_str)
-
-    def request_binance(self, crypto, time_interval="15m", timezone="America/Los_Angeles"):
+    def request_binance(self, crypto, time_interval="15m", current_tz="America/Los_Angeles"):
         """
         1500 data points for all timeframe using binance futures instead of binance spots
         """
@@ -427,44 +230,80 @@ class CryptoDownloader(BaseDownloader):
         data["Low Price"] = data["Low Price"].astype(float)
         data["Close Price"] = data["Close Price"].astype(float)
         data["Volume"] = data["Volume"].astype(float)
-        local_timezone = pytz.timezone(timezone)
+        local_timezone = pytz.timezone(current_tz)
         data["Datetime"] = pd.to_datetime(data['Datetime'], unit='ms', utc=True).dt.tz_convert(local_timezone).dt.strftime('%Y-%m-%d %H:%M:%S')
         data.drop(["Close Time", "Quote Volume", "Number of Trades", "Taker buy base asset volume", "Taker buy quote asset volume",
                    "Ignore"], axis=1, inplace=True)
         return data
 
-    def request_tiingo(self, crypto, start_date, timezone="America/Los_Angeles"):
-        interval = "1hour"
-        session = requests.Session()
-        retry = Retry(
-            total=1,
-            read=1,
-            connect=1,
-            backoff_factor=0.3,
-            status_forcelist=[500, 502, 504],
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Token {self.api_keys["tiingo"]}'
-        }
-        start_date_str = start_date.strftime("%Y-%m-%d")
-        end_date_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")  # plus one day to get the latest
-        url = REQUEST_CRYPTO_TIINGO_URL.format(crypto=crypto, start_date_str=start_date_str, end_date_str=end_date_str,
-                                               interval=interval)
-        response = session.get(url, headers=headers, timeout=30)
-        df = None
-        if response.status_code == 200:
-            data = response.json()
-            if not data:
-                return None
-            df = pd.DataFrame(data[0]["priceData"])
-            df.rename(columns={"open": "Open Price", "high": "High Price", "low": "Low Price", "close": "Close Price",
-                               'date': 'Datetime', 'tradesDone': 'Trades Done', 'volume': 'Volume',
-                               "volumeNotional": "Volume Notional"}, inplace=True)
-            df.drop(["Trades Done", "Volume Notional"], axis=1, inplace=True)
+    def get_crypto(self, crypto, start_date=None, time_interval="4h", timezone="America/Los_Angeles"):
+        success = False
+        try:
+            if start_date is None:
+                # Fetch only the latest 1500 datapoints
+                response = self.binance_client.futures_klines(
+                    symbol=crypto,
+                    interval=time_interval,
+                    limit=1500
+                )
+                df = pd.DataFrame(response,
+                                  columns=["Datetime", "Open Price", "High Price", "Low Price", "Close Price", "Volume",
+                                           "Close Time", "Quote Volume", "Number of Trades",
+                                           "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"])
+            else:
+                # Fetch historical data from the start_date
+                start_timestamp = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
+                end_timestamp = int(datetime.now().timestamp() * 1000)
+
+                all_data = []
+                current_timestamp = start_timestamp
+
+                while current_timestamp < end_timestamp:
+                    response = self.binance_client.futures_klines(
+                        symbol=crypto,
+                        interval=time_interval,
+                        startTime=current_timestamp,
+                        limit=1500
+                    )
+
+                    if not response:
+                        break
+
+                    df = pd.DataFrame(response,
+                                      columns=["Datetime", "Open Price", "High Price", "Low Price", "Close Price",
+                                               "Volume", "Close Time", "Quote Volume", "Number of Trades",
+                                               "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"])
+                    all_data.append(df)
+
+                    current_timestamp = int(df.iloc[-1]['Close Time']) + 1
+
+                if not all_data:
+                    raise Exception("No data retrieved")
+
+                df = pd.concat(all_data, ignore_index=True)
+
+            df = df.drop_duplicates(subset=['Datetime'], keep='first')
+
+            for col in ["Open Price", "High Price", "Low Price", "Close Price", "Volume"]:
+                df[col] = df[col].astype(float)
+
             local_timezone = pytz.timezone(timezone)
-            df['Datetime'] = pd.to_datetime(df.Datetime, utc=True).dt.tz_convert(local_timezone).dt.strftime(DB_STRFTIME_FORMAT)
-        return df
+            df["Datetime"] = pd.to_datetime(df['Datetime'], unit='ms', utc=True).dt.tz_convert(
+                local_timezone).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+            df.drop(["Close Time", "Quote Volume", "Number of Trades", "Taker buy base asset volume",
+                     "Taker buy quote asset volume", "Ignore"], axis=1, inplace=True)
+
+            df.reset_index(drop=True, inplace=True)
+
+            for duration in CRYPTO_SMA:
+                df[f"SMA_{duration}"] = round(df.loc[:, "Close Price"].rolling(window=duration).mean(), 20)
+
+            success = True
+            print(f"{crypto} -> Get data from binance successfully ({df['Datetime'].iloc[0]} to {df['Datetime'].iloc[-1]})")
+
+            return crypto, success, df
+
+        except Exception as e:
+            print(f"{crypto} -> Error: {e}")
+            return crypto, success, str(e)

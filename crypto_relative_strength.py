@@ -56,10 +56,9 @@ def test_strategy(symbol: str, time_interval: str, days: int):
 def crpto(timeframe, total_days, webhook_url):
     print("crypto")
     crypto_downloader = CryptoDownloader()
-    crypto_downloader.check_crypto_table()
     all_cryptos = crypto_downloader.get_all_symbols()
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         future_tasks = [executor.submit(test_strategy, crypto, timeframe, total_days) for crypto in all_cryptos]
         results = [future.result() for future in as_completed(future_tasks)]
 
@@ -105,8 +104,8 @@ def crpto(timeframe, total_days, webhook_url):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-t', '--timeframe', type=str, help='Time frame (3m, 5m, 15m, 30m, 1h, 2h, 4h)', default="4h")
-    parser.add_argument('-d', '--total_days', type=int, help='Calculation duration in days (default 7 days)', default=5)
+    parser.add_argument('-t', '--timeframe', type=str, help='Time frame (3m, 5m, 15m, 30m, 1h, 2h, 4h)', default="15m")
+    parser.add_argument('-d', '--total_days', type=int, help='Calculation duration in days (default 7 days)', default=7)
     parser.add_argument('-u', '--webhook', type=str, help='discord webhook url', default='')
     args = parser.parse_args()
     timeframe = args.timeframe
