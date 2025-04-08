@@ -105,7 +105,7 @@ def crpto(timeframe, total_days, webhook_url):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-t', '--timeframe', type=str, help='Time frame (3m, 5m, 15m, 30m, 1h, 2h, 4h)', default="15m")
-    parser.add_argument('-d', '--total_days', type=int, help='Calculation duration in days (default 7 days)', default=7)
+    parser.add_argument('-d', '--total_days', type=int, help='Calculation duration in days (default 3 days)', default=3)
     parser.add_argument('-u', '--webhook', type=str, help='discord webhook url', default='')
     args = parser.parse_args()
     timeframe = args.timeframe
