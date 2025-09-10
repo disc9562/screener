@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-from config import get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET, DISCORD_WEBHOOK_URL
+from config import get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET
 from data.transformer import transform_crypto_data
 from strategy.strong_target_screener import StrongTargetScreener
 from strategy.alligator_strategy import AlligatorStrategy
