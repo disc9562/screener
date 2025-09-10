@@ -67,7 +67,8 @@ def main(args):
 
     webhook_urls_map = {
         "volume_on": webhook_on,
-        "volume_off": webhook_off
+        "volume_off": webhook_off,
+        "general_targets": strategy_config.get("DISCORD_WEBHOOK_URL_GENERAL_TARGETS")
     }
     notification_service = NotificationService(webhook_urls_map=webhook_urls_map)
     
@@ -83,6 +84,10 @@ def main(args):
         notification_service.send_list_change_notification(
             added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
         )
+    # Send general strong targets notification
+    notification_service.send_list_change_notification(
+        added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets"
+    )
         all_symbols_to_subscribe.update(initial_strong_targets)
         all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols())
 
@@ -119,6 +124,10 @@ def main(args):
                         notification_service.send_list_change_notification(
                             added=added, removed=removed, is_volume_on=pair["is_volume_on"]
                         )
+                # Send general strong targets notification
+                notification_service.send_list_change_notification(
+                    added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets"
+                )
                     
                     pair["strong_targets"] = new_strong_targets
                 last_screener_run = datetime.now()
