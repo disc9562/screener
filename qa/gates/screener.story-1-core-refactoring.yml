@@ -1,0 +1,59 @@
+schema: 1
+story: 'screener.story-1'
+story_title: '核心架構重構'
+gate: CONCERNS
+status_reason: '存在測試覆蓋率、錯誤處理、效能規劃和 API 頻率限制等問題，但非阻礙性缺陷。'
+reviewer: 'Quinn (Test Architect)'
+updated: '2025-09-04T10:00:00Z' # Placeholder for current timestamp
+
+top_issues:
+  - action: '為 `data/transformer.py` 模組增加單元測試。'
+    suggested_owner: dev
+  - action: '增加更全面的整合測試，驗證 `fetcher` 和 `transformer` 模組在實際數據流中的協同工作。'
+    suggested_owner: dev
+  - action: '考慮為 `test_refactor.py` 增加斷言，使其成為一個更嚴格的驗證腳本。'
+    suggested_owner: dev
+  - action: '強化 `fetcher.py` 中的錯誤處理機制，使其能更優雅地處理 API 錯誤和網路問題。'
+    suggested_owner: dev
+  - action: '規劃並實作使用者友善的錯誤訊息。'
+    suggested_owner: dev
+  - action: '建立一個持續的效能監控機制，並設定效能目標。'
+    suggested_owner: dev
+  - action: '強化 `fetcher.py` 中的頻率限制處理，確保其能適應不同交易所的複雜規則。'
+    suggested_owner: dev
+  - action: '在專案中設定一個 Linter (例如 `flake8` 或 `black`)，並將其納入開發流程。'
+    suggested_owner: dev
+
+quality_score: 80
+expires: '2025-09-18T10:00:00Z' # 2 weeks from review date
+
+evidence:
+  tests_reviewed: 5 # Number of tests in test_fetcher.py and test_performance.py
+  risks_identified: 8 # Number of items in improvements checklist
+  trace:
+    ac_covered: [1, 2, 3, 4, 5] # All ACs covered
+    ac_gaps: []
+
+nfr_validation:
+  security:
+    status: PASS
+    notes: 'API 金鑰已透過 .env 檔案管理，符合基本安全實踐。'
+  performance:
+    status: CONCERNS
+    notes: '已建立舊腳本的效能基準測試，但尚未設定新系統的效能目標或進行優化。'
+  reliability:
+    status: CONCERNS
+    notes: '錯誤處理和 API 頻率限制處理仍需強化。'
+  maintainability:
+    status: PASS
+    notes: '程式碼模組化，結構清晰。'
+
+recommendations:
+  immediate: # Must fix before production
+    - action: '定義一個簡單的回滾策略，並在 README 中說明。'
+      refs: ['README.md']
+  future: # Can be addressed later
+    - action: '全面提升測試覆蓋率，特別是整合測試。'
+      refs: ['tests/']
+    - action: '實作更完善的錯誤處理和日誌記錄。'
+      refs: ['data/fetcher.py', 'services/']

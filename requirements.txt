@@ -13,4 +13,7 @@ APScheduler
 python-dotenv
 ccxt
 TA-Lib
-
+pytest
+pytest-mock
+polygon-api-client
+binance-connector

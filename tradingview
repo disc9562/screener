@@ -1,0 +1,85 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © j9a82100
+// 新鱷魚策略 - 整合突兀量標記
+
+//@version=5
+strategy("鱷魚策略_改", overlay=true, commission_value = 0.06)
+
+// 簡化變數，只需要單一倉位
+// var init_position = 0.0
+
+// ========== 突兀量標記設定 ==========
+// 創建一個輸入框讓使用者自己輸入交易量倍數
+volumeMultiplier = input.float(2.5, title="Volume Multiplier", minval=1, step=0.1)
+// 突兀量開關
+useVolumeCondition = input.bool(true, title="Use Volume Condition")
+// 風險百分比設定
+risk_percent = input.float(0.05, title="Risk Percent", minval=0.01, maxval=0.2, step=0.01)
+
+// 獲取K棒的交易量
+currentVolume = volume
+previousVolume = volume[1]
+
+// 檢查當前K棒的交易量是否大於前一根K棒交易量的指定倍數
+volumeCondition = currentVolume > previousVolume * volumeMultiplier
+
+// 如果滿足條件，將K棒塗成黃色
+barcolor(volumeCondition ? color.new(color.yellow, 0) : na)
+
+// ========== SMMA均線系統 ==========
+sma10 = ta.sma(close, 10)
+sma20 = ta.sma(close, 20)
+sma50 = ta.sma(close, 50)
+sma233 = ta.sma(close, 233)
+
+smma10 = 0.0
+smma20 = 0.0
+smma50 = 0.0
+smma233 = 0.0
+
+smma10 := na(smma10[1]) ? sma10 : (smma10[1] * (10 - 1) + close) / 10
+smma20 := na(smma20[1]) ? sma20 : (smma20[1] * (20 - 1)+ close) / 20
+smma50 := na(smma50[1]) ? sma50 : (smma50[1] * (50 - 1) + close) / 50
+smma233 := na(smma233[1]) ? sma233 : (smma233[1] * (233 - 1) + close) / 233
+
+plot(smma10, "SMMA10", color.green, 1, plot.style_line)
+plot(smma20, "SMMA20", color.yellow, 1, plot.style_line)
+plot(smma50, "SMMA50", color.blue, 1, plot.style_line)
+plot(smma233, "SMMA233", color.red, 1, plot.style_line)
+
+// ========== 交易設定 ==========
+
+// ========== 止損邏輯 ==========
+if strategy.position_size > 0
+    stop_price = smma233
+    strategy.exit("exit long", "long", stop = smma233, alert_message = "多單止損 止損價:" + str.tostring(stop_price, "#.####"))
+
+// 加倉機制已移除，只保留單一倉位交易
+
+// ========== 重置變數 ==========
+// 單一倉位不需要複雜的變數重置
+
+// ========== 進場條件 (整合突兀量標記) ==========
+// 基本進場條件
+baseCondition = smma10 > smma20 and smma20 > smma50 and smma50 > smma233 and close > smma233 and close > smma10 and strategy.position_size == 0
+// 根據開關決定是否使用突兀量條件
+longCondition = useVolumeCondition ? baseCondition and volumeCondition : baseCondition
+
+// 繪製進場信號
+plotshape(longCondition, color = color.green, style = shape.arrowup, text="多", textcolor=color.white)
+
+// ========== 開倉邏輯 ==========
+if longCondition
+    entry_price = close
+    stop_price = smma233
+    offset = close - smma233
+    target_price = entry_price + 20 * offset
+    units = strategy.equity * risk_percent / offset
+
+        // 開倉訊息
+    entry_message = "開多 進場價:" + str.tostring(entry_price, "#.####") + " 止損價:" + str.tostring(stop_price, "#.####")
+    // 出場訊息
+    exit_message = "多單出場 目標價:" + str.tostring(target_price, "#.####") + " 止損價:" + str.tostring(stop_price, "#.####")
+    
+    strategy.order("long", strategy.long, qty = units, alert_message = entry_message)
+    strategy.exit("exit long", "long", limit = close + 20 * offset, stop = smma233, alert_message = exit_message)

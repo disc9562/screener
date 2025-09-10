@@ -1,0 +1,16 @@
+# BMAD Quality Gate
+story_id: story-4-alligator-strategy-implementation
+epic: screener-v2
+status: CONCERNS
+reviewed_by: Quinn (Test Architect)
+review_date: '2025-09-08'
+concerns:
+  - type: Technical Debt
+    severity: Medium
+    description: "The StrongTargetScreener is tightly coupled with the RelativeStrengthStrategy, reducing modularity."
+    recommendation: "Refactor the screener to be strategy-agnostic."
+  - type: Stability Risk
+    severity: High
+    description: "The application is prone to frequent API rate-limiting errors from the exchange, which can disrupt data flow."
+    recommendation: "Implement a WebSocket-based data fetching solution for real-time data to avoid rate-limiting bans, as suggested by the API error messages."
+waiver_approver: null
