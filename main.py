@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 kline_cache = {}
 
-def process_kline_message(msg, position_manager, alligator_strategy, strong_targets):
+def process_kline_message(msg, position_manager, alligator_strategy, strong_targets, is_volume_on: bool):
     try:
         if msg.get('k', {}).get('x'): # Process only closed klines
             kline_data = msg['k']
@@ -39,11 +39,13 @@ def process_kline_message(msg, position_manager, alligator_strategy, strong_targ
             position_manager.update_positions({symbol: df.iloc[-1]})
             
             if symbol in strong_targets:
+                # Pass is_volume_on to run_with_existing_data if it needs to be used there
+                # For now, AlligatorStrategy uses its own config, so no need to pass here
                 signals = alligator_strategy.run_with_existing_data(df)
                 if signals:
                     last_signal = signals[-1]
-                    logging.info(f"SIGNALS FOUND for {symbol}: {last_signal}")
-                    position_manager.open_position(symbol, last_signal)
+                    logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {last_signal}")
+                    position_manager.open_position(symbol, last_signal, is_volume_on=is_volume_on) # Pass is_volume_on
 
     except Exception as e:
         logging.error(f"Error processing kline message: {e}", exc_info=True)
@@ -54,18 +56,37 @@ def main(args):
     timeout = args.timeout
 
     strategy_config = get_strategy_config()
-    notification_service = NotificationService(webhook_url=DISCORD_WEBHOOK_URL)
-    position_manager = PositionManager(notification_service=notification_service, strategy_config=strategy_config)
-    alligator_strategy = AlligatorStrategy(strategy_config)
+
+    # AC5: Strict Webhook Configuration Validation
+    webhook_on = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_ON")
+    webhook_off = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_OFF")
+
+    if not webhook_on or not webhook_off:
+        logging.error("Error: Both DISCORD_WEBHOOK_URL_VOLUME_ON and DISCORD_WEBHOOK_URL_VOLUME_OFF must be configured in .env")
+        sys.exit(1) # Exit the application
+
+    webhook_urls_map = {
+        "volume_on": webhook_on,
+        "volume_off": webhook_off
+    }
+    notification_service = NotificationService(webhook_urls_map=webhook_urls_map)
     
     logging.info("Performing initial screening for strong targets...")
-    screener = StrongTargetScreener(strategy_config)
-    strong_targets = set(screener.run_screener())
-    logging.info(f"Initial strong targets: {strong_targets}")
-    notification_service.send_list_change_notification(added=strong_targets, removed=set())
+    screener = StrongTargetScreener(strategy_config) # Screener uses base config
+    
+    # Run initial screening for both strategies
+    all_symbols_to_subscribe = set()
+    for strategy_type, pair in strategy_pairs.items():
+        initial_strong_targets = set(screener.run_screener())
+        pair["strong_targets"] = initial_strong_targets
+        logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
+        notification_service.send_list_change_notification(
+            added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
+        )
+        all_symbols_to_subscribe.update(initial_strong_targets)
+        all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols())
 
-    open_positions = set(position_manager.get_open_positions_symbols())
-    symbols_to_subscribe = list(strong_targets.union(open_positions))
+    symbols_to_subscribe = list(all_symbols_to_subscribe)
 
     ws_manager = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
     ws_manager.start(symbols=symbols_to_subscribe, interval='15m')
@@ -82,27 +103,38 @@ def main(args):
 
             if datetime.now() - last_screener_run > timedelta(hours=4):
                 logging.info("Periodically re-running screener...")
-                new_strong_targets = set(screener.run_screener())
-                
-                current_symbols = set(symbols_to_subscribe)
-                added = new_strong_targets - current_symbols
-                removed = current_symbols - new_strong_targets - open_positions
-                
-                if added:
-                    logging.info(f"New symbols to subscribe to: {added}")
-                    ws_manager.subscribe(list(added))
-                    symbols_to_subscribe.extend(list(added))
-                
-                if added or removed:
-                    notification_service.send_list_change_notification(added=added, removed=removed)
-                
-                strong_targets = new_strong_targets
+                for strategy_type, pair in strategy_pairs.items():
+                    new_strong_targets = set(screener.run_screener())
+                    
+                    current_symbols = pair["strong_targets"]
+                    added = new_strong_targets - current_symbols
+                    removed = current_symbols - new_strong_targets - set(pair["position_manager"].get_open_positions_symbols())
+                    
+                    if added:
+                        logging.info(f"New symbols to subscribe to for {strategy_type} strategy: {added}")
+                        ws_manager.subscribe(list(added))
+                        symbols_to_subscribe.extend(list(added))
+                    
+                    if added or removed:
+                        notification_service.send_list_change_notification(
+                            added=added, removed=removed, is_volume_on=pair["is_volume_on"]
+                        )
+                    
+                    pair["strong_targets"] = new_strong_targets
                 last_screener_run = datetime.now()
 
             try:
                 message = ws_manager.get_message(block=True, timeout=1)
                 if message:
-                    process_kline_message(message, position_manager, alligator_strategy, strong_targets)
+                    # Process kline message for each strategy
+                    for strategy_type, pair in strategy_pairs.items():
+                        process_kline_message(
+                            message,
+                            pair["position_manager"],
+                            pair["alligator_strategy"],
+                            pair["strong_targets"],
+                            pair["is_volume_on"] # Pass is_volume_on to process_kline_message
+                        )
             except queue.Empty:
                 continue
 

@@ -6,7 +6,7 @@ from strategy.alligator_strategy import AlligatorStrategy
 def alligator_strategy():
     """Returns an instance of AlligatorStrategy with a mock config."""
     config = {
-        'use_volume_condition': True,
+        'use_volume_condition': True, # Default to True for most tests
         'volume_multiplier': 2.5,
         'equity': 100000,
         'risk_percent': 0.05
@@ -71,3 +71,49 @@ def test_signal_generation_and_content(alligator_strategy):
     expected_units = (equity * risk_percent) / offset
     
     assert signal['units'] == pytest.approx(expected_units)
+
+def test_volume_condition_off_no_signal(alligator_strategy):
+    """
+    Tests that no signal is generated when volume condition is OFF, even if other conditions are met.
+    """
+    # Arrange: Data that should NOT generate a signal even if volume condition is OFF
+    # Create a dataset where base conditions are NOT met (e.g., a downtrend)
+    data = {
+        'Close':  [225, 220, 215, 210, 205, 200, 195, 190, 185, 180],
+        'Volume': [100, 110, 120, 130, 140, 150, 160, 170, 180, 190] # Volume doesn't matter here
+    }
+    df = pd.DataFrame(data)
+
+    # Set use_volume_condition to False in the strategy config
+    alligator_strategy.config['use_volume_condition'] = False
+
+    # Act
+    signals = alligator_strategy._analyze(df.copy())
+
+    # Assert
+    assert isinstance(signals, list)
+    assert len(signals) == 0, "A signal was generated when volume condition was OFF and not expected"
+
+def test_volume_condition_off_signal_generated(alligator_strategy):
+    """
+    Tests that a signal is generated when volume condition is OFF, and base conditions are met.
+    """
+    # Arrange: Data where base conditions are met, and volume condition is OFF
+    data = {
+        'Close':  [180, 185, 190, 195, 200, 205, 210, 215, 220, 225],
+        'Volume': [100, 110, 120, 130, 140, 150, 160, 170, 180, 190] # Volume doesn't matter here
+    }
+    df = pd.DataFrame(data)
+
+    # Set use_volume_condition to False in the strategy config
+    alligator_strategy.config['use_volume_condition'] = False
+
+    # Act
+    signals = alligator_strategy._analyze(df.copy())
+
+    # Assert
+    assert isinstance(signals, list)
+    assert len(signals) > 0, "No BUY signal was generated when volume condition was OFF and expected"
+    signal = signals[0]
+    assert signal['signal'] == 'BUY'
+    assert signal['entry_price'] == 225
