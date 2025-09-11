@@ -2,7 +2,7 @@ install:
 	pip install -r requirements.txt
 
 run:
-	python main.py
+	python main.py $(ARGS)
 
 test:
 	pytest tests/

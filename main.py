@@ -71,23 +71,61 @@ def main(args):
         "general_targets": strategy_config.get("DISCORD_WEBHOOK_URL_GENERAL_TARGETS")
     }
     notification_service = NotificationService(webhook_urls_map=webhook_urls_map)
+
+    # Task 5.1: Instantiate two strategy/position manager pairs
+    # Strategy 1: Volume ON
+    strategy_config_volume_on = strategy_config.copy()
+    strategy_config_volume_on["use_volume_condition"] = True
+    position_manager_volume_on = PositionManager(notification_service=notification_service, strategy_config=strategy_config_volume_on)
+    alligator_strategy_volume_on = AlligatorStrategy(strategy_config_volume_on)
+
+    # Strategy 2: Volume OFF
+    strategy_config_volume_off = strategy_config.copy()
+    strategy_config_volume_off["use_volume_condition"] = False
+    position_manager_volume_off = PositionManager(notification_service=notification_service, strategy_config=strategy_config_volume_off)
+    alligator_strategy_volume_off = AlligatorStrategy(strategy_config_volume_off)
+
+    # Store strategy pairs in a dictionary for easier iteration
+    strategy_pairs = {
+        "volume_on": {
+            "position_manager": position_manager_volume_on,
+            "alligator_strategy": alligator_strategy_volume_on,
+            "strong_targets": set(), # Initial empty set for strong targets
+            "is_volume_on": True
+        },
+        "volume_off": {
+            "position_manager": position_manager_volume_off,
+            "alligator_strategy": alligator_strategy_volume_off,
+            "strong_targets": set(), # Initial empty set for strong targets
+            "is_volume_on": False
+        }
+    }
     
-    logging.info("Performing initial screening for strong targets...")
     screener = StrongTargetScreener(strategy_config) # Screener uses base config
-    
-    # Run initial screening for both strategies
-    all_symbols_to_subscribe = set()
-    for strategy_type, pair in strategy_pairs.items():
-        initial_strong_targets = set(screener.run_screener())
-        pair["strong_targets"] = initial_strong_targets
-        logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
-        notification_service.send_list_change_notification(
-            added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
-        )
-    # Send general strong targets notification
-    notification_service.send_list_change_notification(
-        added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets"
-    )
+
+    # Task 3.2: Implement --fetch-now logic
+    if args.fetch_now:
+        logging.info("Manual fetch triggered (--fetch-now). Bypassing schedule.")
+        for strategy_type, pair in strategy_pairs.items():
+            initial_strong_targets = set(screener.run_screener())
+            pair["strong_targets"] = initial_strong_targets
+            logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
+            notification_service.send_list_change_notification(
+                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
+            )
+        all_symbols_to_subscribe.update(initial_strong_targets)
+        all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols())
+    else:
+        logging.info("Performing initial screening for strong targets (scheduled).")
+        # Run initial screening for both strategies
+        all_symbols_to_subscribe = set()
+        for strategy_type, pair in strategy_pairs.items():
+            initial_strong_targets = set(screener.run_screener())
+            pair["strong_targets"] = initial_strong_targets
+            logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
+            notification_service.send_list_change_notification(
+                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
+            )
         all_symbols_to_subscribe.update(initial_strong_targets)
         all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols())
 
@@ -99,38 +137,54 @@ def main(args):
     logging.info("Entering main processing loop...")
     last_screener_run = datetime.now()
     start_time = datetime.now()
+    fetched_times_today = set() # To track scheduled fetches for today
 
     try:
         while True:
+            print(f"DEBUG: current_time: {datetime.now()}, start_time: {start_time}, timeout: {timeout}")
+            print(f"DEBUG: current_time: {datetime.now()}, start_time: {start_time}, timeout: {timeout}")
             if timeout and (datetime.now() - start_time) > timedelta(seconds=timeout):
                 logging.info(f"Timeout of {timeout} seconds reached. Exiting.")
                 break
 
-            if datetime.now() - last_screener_run > timedelta(hours=4):
-                logging.info("Periodically re-running screener...")
-                for strategy_type, pair in strategy_pairs.items():
-                    new_strong_targets = set(screener.run_screener())
+            # Task 2.2: Implement scheduled fetching logic
+            current_time = datetime.now()
+            today_str = current_time.strftime("%Y-%m-%d")
+
+            for fetch_time_str in strategy_config.get("TARGET_FETCH_TIMES"):
+                fetch_hour, fetch_minute = map(int, fetch_time_str.split(':'))
+                scheduled_fetch_time = current_time.replace(hour=fetch_hour, minute=fetch_minute, second=0, microsecond=0)
+
+                # Check if it's time to fetch and if it hasn't been fetched today for this scheduled time
+                print(f"DEBUG: current_time: {current_time}, scheduled_fetch_time: {scheduled_fetch_time}, fetched_times_today: {fetched_times_today}")
+                print(f"DEBUG: current_time: {current_time}, scheduled_fetch_time: {scheduled_fetch_time}, fetched_times_today: {fetched_times_today}")
+                if (current_time >= scheduled_fetch_time and
+                    (today_str, fetch_time_str) not in fetched_times_today):
                     
-                    current_symbols = pair["strong_targets"]
-                    added = new_strong_targets - current_symbols
-                    removed = current_symbols - new_strong_targets - set(pair["position_manager"].get_open_positions_symbols())
-                    
-                    if added:
-                        logging.info(f"New symbols to subscribe to for {strategy_type} strategy: {added}")
-                        ws_manager.subscribe(list(added))
-                        symbols_to_subscribe.extend(list(added))
-                    
-                    if added or removed:
-                        notification_service.send_list_change_notification(
-                            added=added, removed=removed, is_volume_on=pair["is_volume_on"]
-                        )
-                # Send general strong targets notification
-                notification_service.send_list_change_notification(
-                    added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets"
-                )
+                    logging.info(f"Scheduled re-running screener for {fetch_time_str}...")
+                    for strategy_type, pair in strategy_pairs.items():
+                        new_strong_targets = set(screener.run_screener())
+                        
+                        current_symbols = pair["strong_targets"]
+                        added = new_strong_targets - current_symbols
+                        removed = current_symbols - new_strong_targets - set(pair["position_manager"].get_open_positions_symbols())
+                        
+                        if added:
+                            logging.info(f"New symbols to subscribe to for {strategy_type} strategy: {added}")
+                            ws_manager.subscribe(list(added))
+                            symbols_to_subscribe.extend(list(added))
+                        
+                        if added or removed:
+                            notification_service.send_list_change_notification(
+                                added=added, removed=removed, is_volume_on=pair["is_volume_on"]
+                            )
+                    # Send general strong targets notification
+                    notification_service.send_list_change_notification(
+                        added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets"
+                    )
                     
                     pair["strong_targets"] = new_strong_targets
-                last_screener_run = datetime.now()
+                    fetched_times_today.add((today_str, fetch_time_str)) # Mark as fetched for today
 
             try:
                 message = ws_manager.get_message(block=True, timeout=1)
@@ -157,5 +211,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Crypto Screener Bot")
     parser.add_argument('--timeout', type=int, help='Timeout in seconds for debug mode.')
+    parser.add_argument('--fetch-now', action='store_true', help='Immediately fetch strong targets, bypassing schedule.')
     args = parser.parse_args()
     main(args)

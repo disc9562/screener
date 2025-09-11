@@ -22,6 +22,9 @@ TRANSACTION_FEE_PERCENT = float(os.getenv("TRANSACTION_FEE_PERCENT", "0.0006")) 
 # Example: Default timeframe for strategies
 DEFAULT_TIMEFRAME = "1d"
 
+# For strong target scheduling (Story 2.3)
+TARGET_FETCH_TIMES = os.getenv("TARGET_FETCH_TIMES", "08:00,20:00").split(',')
+
 STOCK_SMA_PERIODS = [20, 30, 45, 50, 60, 150, 200]
 CRYPTO_SMA_PERIODS = [30, 45, 60]
 
@@ -68,6 +71,7 @@ def get_strategy_config():
         "DISCORD_WEBHOOK_URL_VOLUME_ON": DISCORD_WEBHOOK_URL_VOLUME_ON,
         "DISCORD_WEBHOOK_URL_VOLUME_OFF": DISCORD_WEBHOOK_URL_VOLUME_OFF,
         "DISCORD_WEBHOOK_URL_GENERAL_TARGETS": DISCORD_WEBHOOK_URL_GENERAL_TARGETS,
+        "TARGET_FETCH_TIMES": TARGET_FETCH_TIMES,
     }
 
 print("Configuration loaded.")

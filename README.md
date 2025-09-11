@@ -65,6 +65,24 @@ make test
 
 # Clean up generated files and caches
 make clean
+
+### Strong Target Fetching Schedule
+
+The application is configured to automatically fetch strong targets twice a day at specific times (defaulting to 08:00 and 20:00 UTC).
+
+You can configure these times in your `.env` file:
+```
+TARGET_FETCH_TIMES="08:00,20:00" # Comma-separated times in HH:MM format
+```
+
+### Manual Strong Target Fetch
+
+For development and testing purposes, you can trigger an immediate strong target fetch, bypassing the schedule.
+
+```bash
+python main.py --fetch-now
+```
+When `--fetch-now` is used, the application will perform one immediate fetch and then exit (unless a `--timeout` is also specified).
 ```
 
 ## Rollback Strategy
