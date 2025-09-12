@@ -52,7 +52,29 @@ This project uses environment variables for sensitive information like API keys 
     ```
     *(Other API keys like BINANCE_API_KEY, BINANCE_API_SECRET, POLYGON_API_KEY should also be set here if needed by your strategies.)*
 
+### WebSocket API Key Configuration
+
+This project uses Binance WebSocket API for real-time data. To enable WebSocket functionality, you need to configure your Binance API Key and API Secret.
+
+1.  **Obtain API Keys**: Log in to your Binance account and generate your API Key and API Secret. Ensure these keys have the necessary permissions for WebSocket access (read-only access is usually sufficient for market data).
+2.  **Configure in `.env`**: Add the following variables to your `.env` file:
+    ```
+    BINANCE_API_KEY=your_binance_api_key_here
+    BINANCE_API_SECRET=your_binance_api_secret_here
+    ```
+
+### Strong Target Notification Configuration
+
+The application can send notifications for changes in the strong target list. This uses Discord webhooks.
+
+1.  **Obtain Discord Webhook URL**: Create a webhook in your Discord server.
+2.  **Configure in `.env`**: Add the following variable to your `.env` file:
+    ```
+    DISCORD_WEBHOOK_URL_GENERAL_TARGETS=your_discord_general_targets_webhook_url_here
+    ```
+
 ### Usage
+
 
 This project uses a `Makefile` to simplify common operations.
 

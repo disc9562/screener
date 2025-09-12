@@ -48,6 +48,9 @@ RISK_PERCENT = 0.05
 # --- File Paths ---
 OUTPUT_DIR = "output"
 
+# For local test mode (Story 2.4)
+TEST_COIN_SUBSET = os.getenv("TEST_COIN_SUBSET", "BTCUSDT,ETHUSDT").split(',')
+
 def get_strategy_config():
     """Gathers all strategy-related configurations into a dictionary."""
     return {
@@ -72,6 +75,7 @@ def get_strategy_config():
         "DISCORD_WEBHOOK_URL_VOLUME_OFF": DISCORD_WEBHOOK_URL_VOLUME_OFF,
         "DISCORD_WEBHOOK_URL_GENERAL_TARGETS": DISCORD_WEBHOOK_URL_GENERAL_TARGETS,
         "TARGET_FETCH_TIMES": TARGET_FETCH_TIMES,
+        "TEST_COIN_SUBSET": TEST_COIN_SUBSET,
     }
 
 print("Configuration loaded.")

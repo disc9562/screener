@@ -36,8 +36,13 @@ class StrongTargetScreener(Strategy):
         all_strong_targets = []
 
         # 1. Get all crypto symbols
-        crypto_symbols = self.crypto_fetcher.get_all_symbols()
-        print(f"Found {len(crypto_symbols)} crypto symbols.")
+        # Check for local test mode (Story 2.4)
+        if self.config.get('local_test_mode'):
+            crypto_symbols = self.config.get('TEST_COIN_SUBSET', [])
+            print(f"Running in local test mode. Using subset of {len(crypto_symbols)} crypto symbols: {crypto_symbols}")
+        else:
+            crypto_symbols = self.crypto_fetcher.get_all_symbols()
+            print(f"Found {len(crypto_symbols)} crypto symbols.")
 
         # 2. Run RelativeStrengthStrategy on all crypto symbols
         print("Running RelativeStrengthStrategy on crypto...")

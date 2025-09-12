@@ -5,6 +5,7 @@ import logging
 import queue
 import argparse
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock # Added for local test mode
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
@@ -102,9 +103,11 @@ def main(args):
     }
     
     screener = StrongTargetScreener(strategy_config) # Screener uses base config
+    screener.config['local_test_mode'] = getattr(args, 'local_test', False) # Pass local_test_mode to screener
 
     # Task 3.2: Implement --fetch-now logic
-    if args.fetch_now:
+    all_symbols_to_subscribe = set() # Initialize here to ensure it's always defined
+    if getattr(args, 'fetch_now', False):
         logging.info("Manual fetch triggered (--fetch-now). Bypassing schedule.")
         for strategy_type, pair in strategy_pairs.items():
             initial_strong_targets = set(screener.run_screener())
@@ -113,12 +116,11 @@ def main(args):
             notification_service.send_list_change_notification(
                 added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
             )
-        all_symbols_to_subscribe.update(initial_strong_targets)
-        all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols())
+            all_symbols_to_subscribe.update(initial_strong_targets) # Move inside loop
+            all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols()) # Move inside loop
     else:
         logging.info("Performing initial screening for strong targets (scheduled).")
         # Run initial screening for both strategies
-        all_symbols_to_subscribe = set()
         for strategy_type, pair in strategy_pairs.items():
             initial_strong_targets = set(screener.run_screener())
             pair["strong_targets"] = initial_strong_targets
@@ -126,13 +128,18 @@ def main(args):
             notification_service.send_list_change_notification(
                 added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
             )
-        all_symbols_to_subscribe.update(initial_strong_targets)
-        all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols())
+            all_symbols_to_subscribe.update(initial_strong_targets) # Move inside loop
+            all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols()) # Move inside loop
 
     symbols_to_subscribe = list(all_symbols_to_subscribe)
 
-    ws_manager = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-    ws_manager.start(symbols=symbols_to_subscribe, interval='15m')
+    # Task 3.1: Disable WebSocket connection in local test mode
+    if not getattr(args, 'local_test', False):
+        ws_manager = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+        ws_manager.start(symbols=symbols_to_subscribe, interval='15m')
+    else:
+        logging.info("WebSocket connection disabled in local test mode.")
+        ws_manager = MagicMock() # Mock ws_manager if not initialized
 
     logging.info("Entering main processing loop...")
     last_screener_run = datetime.now()
@@ -141,8 +148,7 @@ def main(args):
 
     try:
         while True:
-            print(f"DEBUG: current_time: {datetime.now()}, start_time: {start_time}, timeout: {timeout}")
-            print(f"DEBUG: current_time: {datetime.now()}, start_time: {start_time}, timeout: {timeout}")
+            
             if timeout and (datetime.now() - start_time) > timedelta(seconds=timeout):
                 logging.info(f"Timeout of {timeout} seconds reached. Exiting.")
                 break
@@ -156,8 +162,7 @@ def main(args):
                 scheduled_fetch_time = current_time.replace(hour=fetch_hour, minute=fetch_minute, second=0, microsecond=0)
 
                 # Check if it's time to fetch and if it hasn't been fetched today for this scheduled time
-                print(f"DEBUG: current_time: {current_time}, scheduled_fetch_time: {scheduled_fetch_time}, fetched_times_today: {fetched_times_today}")
-                print(f"DEBUG: current_time: {current_time}, scheduled_fetch_time: {scheduled_fetch_time}, fetched_times_today: {fetched_times_today}")
+                
                 if (current_time >= scheduled_fetch_time and
                     (today_str, fetch_time_str) not in fetched_times_today):
                     
@@ -186,31 +191,34 @@ def main(args):
                     pair["strong_targets"] = new_strong_targets
                     fetched_times_today.add((today_str, fetch_time_str)) # Mark as fetched for today
 
-            try:
-                message = ws_manager.get_message(block=True, timeout=1)
-                if message:
-                    # Process kline message for each strategy
-                    for strategy_type, pair in strategy_pairs.items():
-                        process_kline_message(
-                            message,
-                            pair["position_manager"],
-                            pair["alligator_strategy"],
-                            pair["strong_targets"],
-                            pair["is_volume_on"] # Pass is_volume_on to process_kline_message
-                        )
-            except queue.Empty:
-                continue
+            if not getattr(args, 'local_test', False): # Only process WebSocket messages if not in local test mode
+                try:
+                    message = ws_manager.get_message(block=True, timeout=1)
+                    if message:
+                        # Process kline message for each strategy
+                        for strategy_type, pair in strategy_pairs.items():
+                            process_kline_message(
+                                message,
+                                pair["position_manager"],
+                                pair["alligator_strategy"],
+                                pair["strong_targets"],
+                                pair["is_volume_on"] # Pass is_volume_on to process_kline_message
+                            )
+                except queue.Empty:
+                    continue
 
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")
     finally:
-        logging.info("Stopping WebSocket Manager...")
-        ws_manager.stop()
+        if not getattr(args, 'local_test', False): # Only stop WebSocket Manager if not in local test mode
+            logging.info("Stopping WebSocket Manager...")
+            ws_manager.stop()
         logging.info("Application stopped.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Crypto Screener Bot")
     parser.add_argument('--timeout', type=int, help='Timeout in seconds for debug mode.')
     parser.add_argument('--fetch-now', action='store_true', help='Immediately fetch strong targets, bypassing schedule.')
+    parser.add_argument('--local-test', action='store_true', help='Enable local test mode (e.g., subset of coins, no WebSocket).')
     args = parser.parse_args()
     main(args)
