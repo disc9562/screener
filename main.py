@@ -114,7 +114,7 @@ def main(args):
             pair["strong_targets"] = initial_strong_targets
             logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
             notification_service.send_list_change_notification(
-                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
+                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
             )
             all_symbols_to_subscribe.update(initial_strong_targets) # Move inside loop
             all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols()) # Move inside loop
@@ -126,7 +126,7 @@ def main(args):
             pair["strong_targets"] = initial_strong_targets
             logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
             notification_service.send_list_change_notification(
-                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"]
+                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
             )
             all_symbols_to_subscribe.update(initial_strong_targets) # Move inside loop
             all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols()) # Move inside loop
@@ -176,16 +176,17 @@ def main(args):
                         
                         if added:
                             logging.info(f"New symbols to subscribe to for {strategy_type} strategy: {added}")
-                            ws_manager.subscribe(list(added))
+                            if not getattr(args, 'local_test', False):
+                                    ws_manager.subscribe(list(added))
                             symbols_to_subscribe.extend(list(added))
                         
                         if added or removed:
                             notification_service.send_list_change_notification(
-                                added=added, removed=removed, is_volume_on=pair["is_volume_on"]
+                                added=added, removed=removed, is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
                             )
                     # Send general strong targets notification
                     notification_service.send_list_change_notification(
-                        added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets"
+                        added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets", is_local_test=getattr(args, 'local_test', False)
                     )
                     
                     pair["strong_targets"] = new_strong_targets

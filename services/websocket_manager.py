@@ -42,6 +42,20 @@ class WebSocketManager:
         self.logger.info(f"Subscribing to streams: {streams}")
         self.ws_client.subscribe(stream=streams)
 
+    def subscribe(self, symbols: list, interval='15m'):
+        """Subscribes to additional streams."""
+        if not self.ws_client:
+            self.logger.warning("WebSocket client not started. Cannot subscribe to new symbols.")
+            return
+        
+        if not symbols:
+            self.logger.warning("No symbols provided to subscribe.")
+            return
+
+        streams = [f"{symbol.lower()}@kline_{interval}" for symbol in symbols]
+        self.logger.info(f"Subscribing to additional streams: {streams}")
+        self.ws_client.subscribe(stream=streams)
+
     def get_message(self, block=True, timeout=None):
         """Gets a message from the queue."""
         try:

@@ -5,16 +5,22 @@ class NotificationService:
     def __init__(self, webhook_urls_map: dict):
         self.webhook_urls_map = webhook_urls_map
 
-    def _send_embed_notification(self, embed: DiscordEmbed, webhook_type: str = 'default'):
-        """Sends a notification with a prepared DiscordEmbed object to the specified webhook type."""
+    def _send_embed_notification(self, embed: DiscordEmbed, webhook_type: str = 'default', content: str = None):
+        """Sends a notification with a prepared DiscordEmbed object or plain text content to the specified webhook type."""
         webhook_url = self.webhook_urls_map.get(webhook_type)
         if not webhook_url:
             logging.warning(f"Discord webhook URL for type '{webhook_type}' is not set. Notification will not be sent.")
             return
 
         try:
-            webhook = DiscordWebhook(url=webhook_url)
-            webhook.add_embed(embed)
+            if content:
+                if len(content) > 2000:
+                    logging.warning(f"Notification content truncated to 2000 characters for webhook type '{webhook_type}'.")
+                    content = content[:2000]
+                webhook = DiscordWebhook(url=webhook_url, content=content)
+            else:
+                webhook = DiscordWebhook(url=webhook_url)
+                webhook.add_embed(embed)
             response = webhook.execute()
             if response.status_code not in [200, 204]:
                 logging.error(f"Discord webhook for type '{webhook_type}' failed with status {response.status_code}: {response.content}")
@@ -23,45 +29,59 @@ class NotificationService:
 
     def send_trade_notification(self, symbol, action, price, units, reason=None, pnl=None, stop_loss_price=None, is_volume_on: bool = False):
         """Formats and sends a trade event notification."""
-        color = "00ff00" if action == "BUY" else "ff0000" # Green for BUY, Red for SELL
-        
         # AC4: Add identification to notification content
         strategy_tag = "[Volume ON]" if is_volume_on else "[Volume OFF]"
-        title = f"Trade Executed {strategy_tag}: {action.upper()} {symbol}"
-        
-        embed = DiscordEmbed(title=title, color=color)
-        embed.add_embed_field(name="Price", value=f"{price:.4f}")
+        message_parts = [
+            f"Trade Executed {strategy_tag}: {action.upper()} {symbol}",
+            f"Price: {price:.4f}",
+            f"Units: {units:.4f}"
+        ]
         if action == "BUY" and stop_loss_price is not None:
-            embed.add_embed_field(name="Stop Loss", value=f"{stop_loss_price:.4f}")
-        embed.add_embed_field(name="Units", value=f"{units:.4f}")
+            message_parts.append(f"Stop Loss: {stop_loss_price:.4f}")
         if reason:
-            embed.add_embed_field(name="Reason", value=str(reason))
+            message_parts.append(f"Reason: {reason}")
         if pnl is not None:
-            embed.add_embed_field(name="Profit/Loss", value=f"{pnl:.2f} USD")
-        embed.set_timestamp()
+            message_parts.append(f"Profit/Loss: {pnl:.2f} USD")
+        
+        content = "\n".join(message_parts)
         
         webhook_type = "volume_on" if is_volume_on else "volume_off"
-        self._send_embed_notification(embed, webhook_type=webhook_type)
+        self._send_embed_notification(embed=None, webhook_type=webhook_type, content=content) # Pass content, embed is None
 
-    def send_list_change_notification(self, added: set, removed: set, is_volume_on: bool = False):
+    def send_list_change_notification(self, added: set, removed: set, is_volume_on: bool = False, webhook_type: str = None, is_local_test: bool = False):
         """Formats and sends a notification for changes in the strong target list."""
-        if not added and not removed:
+        # Allow sending empty notifications if webhook_type is explicitly provided (e.g., for general_targets)
+        # or if there are actual changes, or if in local test mode.
+        if not added and not removed and not webhook_type and not is_local_test:
             return
 
         # AC4: Add identification to notification content
         strategy_tag = "[Volume ON]" if is_volume_on else "[Volume OFF]"
-        title = f"Strong Target List Updated {strategy_tag}"
-        embed = DiscordEmbed(title=title, color="0000ff") # Blue for info
+        
+        message_parts = []
+        if webhook_type == "general_targets":
+            message_parts.append("General Strong Target List Update")
+            if added:
+                added_str = ", ".join(map(str, added))
+                if len(added_str) > 1800: # Leave some room for other parts of the message
+                    added_str = added_str[:1800] + "... (truncated)"
+                message_parts.append(f"✅ All Targets: {added_str}")
+            if removed:
+                removed_str = ", ".join(map(str, removed))
+                if len(removed_str) > 1800: # Leave some room for other parts of the message
+                    removed_str = removed_str[:1800] + "... (truncated)"
+                message_parts.append(f"❌ Removed: {removed_str}")
+        else:
+            message_parts.append(f"Strong Target List Updated {strategy_tag}")
+            if added:
+                added_str = ", ".join(map(str, added))
+                message_parts.append(f"✅ Added: {added_str}")
+            if removed:
+                removed_str = ", ".join(map(str, removed))
+                message_parts.append(f"❌ Removed: {removed_str}")
+        
+        content = "\n".join(message_parts)
 
-        if added:
-            added_str = ", ".join(added)
-            embed.add_embed_field(name="✅ Added", value=added_str, inline=False)
-        
-        if removed:
-            removed_str = ", ".join(removed)
-            embed.add_embed_field(name="❌ Removed", value=removed_str, inline=False)
-            
-        embed.set_timestamp()
-        
-        webhook_type = "volume_on" if is_volume_on else "volume_off" # Default to volume_off for list changes
-        self._send_embed_notification(embed, webhook_type=webhook_type)
+        # Use provided webhook_type if available, otherwise default based on is_volume_on
+        target_webhook_type = webhook_type if webhook_type else ("volume_on" if is_volume_on else "volume_off")
+        self._send_embed_notification(embed=None, webhook_type=target_webhook_type, content=content)
