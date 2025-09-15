@@ -1,3 +1,4 @@
+import logging
 from strategy.base import Strategy
 from data.fetcher import CryptoFetcher
 from data.transformer import transform_crypto_data
