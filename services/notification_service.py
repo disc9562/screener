@@ -25,7 +25,7 @@ class NotificationService:
             if response.status_code not in [200, 204]:
                 logging.error(f"Discord webhook for type '{webhook_type}' failed with status {response.status_code}: {response.content}")
         except Exception as e:
-            logging.error(f"Error sending Discord notification for type '{webhook_type}': {e}", exc_info=True)
+            logging.error(f"Error sending Discord notification for type '{webhook_type}': {e}")
 
     def send_trade_notification(self, symbol, action, price, units, reason=None, pnl=None, stop_loss_price=None, is_volume_on: bool = False):
         """Formats and sends a trade event notification."""
@@ -85,3 +85,24 @@ class NotificationService:
         # Use provided webhook_type if available, otherwise default based on is_volume_on
         target_webhook_type = webhook_type if webhook_type else ("volume_on" if is_volume_on else "volume_off")
         self._send_embed_notification(embed=None, webhook_type=target_webhook_type, content=content)
+
+    def send_subscription_notification(self, symbols: list, subscription_type: str):
+        """Formats and sends a notification for k-line stream subscriptions."""
+        if not symbols:
+            return
+
+        symbols_str = ", ".join(map(str, symbols))
+        if len(symbols_str) > 1800:
+            symbols_str = symbols_str[:1800] + "... (truncated)"
+        
+        message = f"Successfully subscribed to {subscription_type} k-line streams for: {symbols_str}"
+        self._send_embed_notification(embed=None, webhook_type='general_targets', content=message)
+
+    def send_heartbeat_notification(self, is_volume_on: bool = None):
+        """Sends a heartbeat notification to indicate the bot is running."""
+        message = "Heartbeat: No new positions opened in the last 15 minutes. The bot is running."
+        if is_volume_on is None:
+            webhook_type = 'general_targets'
+        else:
+            webhook_type = "volume_on" if is_volume_on else "volume_off"
+        self._send_embed_notification(embed=None, webhook_type=webhook_type, content=message)

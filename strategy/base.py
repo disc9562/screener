@@ -25,7 +25,7 @@ class Strategy(ABC):
             return None
 
         # 3. Analyze Data and Generate Signals
-        signals = self._analyze(df)
+        signals = self._analyze(df, symbol)
         
         print(f"Strategy for {symbol} completed. Signals: {signals}")
         return signals
@@ -41,7 +41,7 @@ class Strategy(ABC):
         pass
 
     @abstractmethod
-    def _analyze(self, df: pd.DataFrame):
+    def _analyze(self, df: pd.DataFrame, symbol: str):
         """Abstract method to analyze the DataFrame and generate signals."""
         pass
 

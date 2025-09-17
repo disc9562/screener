@@ -11,45 +11,55 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
 from config import get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET
 from data.transformer import transform_crypto_data
+from data.fetcher import CryptoFetcher
 from strategy.strong_target_screener import StrongTargetScreener
 from strategy.alligator_strategy import AlligatorStrategy
 from services.position_manager import PositionManager
 from services.websocket_manager import WebSocketManager
 from services.notification_service import NotificationService
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='application.log', filemode='w')
 
 kline_cache = {}
 
 def process_kline_message(msg, position_manager, alligator_strategy, strong_targets, is_volume_on: bool):
     try:
-        if msg.get('k', {}).get('x'): # Process only closed klines
-            kline_data = msg['k']
-            symbol = kline_data['s']
+        if msg.get('x'): # Process only closed klines (msg['x'] is now directly accessible)
+            kline_data = msg['k'] # Raw kline list
+            symbol = msg['s'] # Symbol is now directly accessible
+            
             
             if symbol not in kline_cache:
                 kline_cache[symbol] = []
             kline_cache[symbol].append(kline_data)
             if len(kline_cache[symbol]) > 500:
                 kline_cache[symbol].pop(0)
+            
 
             df = transform_crypto_data(kline_cache[symbol])
+            
+            if not df.empty:
+                pass
+                
             if df.empty:
                 return
 
             position_manager.update_positions({symbol: df.iloc[-1]})
             
-            if symbol in strong_targets:
+            
+            if symbol in strong_targets: # This condition is now met for BTCUSDT
+                
                 # Pass is_volume_on to run_with_existing_data if it needs to be used there
                 # For now, AlligatorStrategy uses its own config, so no need to pass here
+                
                 signals = alligator_strategy.run_with_existing_data(df)
                 if signals:
                     last_signal = signals[-1]
                     logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {last_signal}")
-                    position_manager.open_position(symbol, last_signal, is_volume_on=is_volume_on) # Pass is_volume_on
+                    position_manager.open_position(symbol, last_signal)
 
     except Exception as e:
-        logging.error(f"Error processing kline message: {e}", exc_info=True)
+        logging.error(f"Error processing kline message: {e}")
 
 def main(args):
     logging.info("Application starting...")
@@ -112,7 +122,6 @@ def main(args):
         for strategy_type, pair in strategy_pairs.items():
             initial_strong_targets = set(screener.run_screener())
             pair["strong_targets"] = initial_strong_targets
-            logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
             notification_service.send_list_change_notification(
                 added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
             )
@@ -124,7 +133,6 @@ def main(args):
         for strategy_type, pair in strategy_pairs.items():
             initial_strong_targets = set(screener.run_screener())
             pair["strong_targets"] = initial_strong_targets
-            logging.info(f"Initial strong targets for {strategy_type} strategy: {initial_strong_targets}")
             notification_service.send_list_change_notification(
                 added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
             )
@@ -135,14 +143,61 @@ def main(args):
 
     # Task 3.1: Disable WebSocket connection in local test mode
     if not getattr(args, 'local_test', False):
-        ws_manager = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+        ws_manager = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
         ws_manager.start(symbols=symbols_to_subscribe, interval='15m')
     else:
-        logging.info("WebSocket connection disabled in local test mode.")
+        logging.info("WebSocket connection disabled in local test mode. Simulating historical k-line data.")
         ws_manager = MagicMock() # Mock ws_manager if not initialized
+        
+        crypto_fetcher = CryptoFetcher()
+        test_symbols = strategy_config.get('TEST_COIN_SUBSET', [])
+        
+        # Fetch historical data for test symbols
+        historical_data = {}
+        for symbol in test_symbols:
+            logging.info(f"Fetching historical data for {symbol}...")
+            # Fetch enough data for Alligator strategy (e.g., 500 klines for 15m)
+            data = crypto_fetcher.fetch_klines(symbol, '15m', limit=500)
+            if data:
+                historical_data[symbol] = data
+            else:
+                logging.warning(f"No historical data found for {symbol}.")
+
+        # Simulate k-line messages
+        logging.info("Simulating k-line messages...")
+        # Assuming all symbols have the same number of klines for simplicity
+        # Iterate through klines as if they were arriving in real-time
+        if test_symbols and historical_data.get(test_symbols[0]):
+            num_klines = len(historical_data[test_symbols[0]])
+            for i in range(num_klines):
+                for symbol in test_symbols:
+                    if symbol in historical_data and i < len(historical_data[symbol]):
+                        kline_data = historical_data[symbol][i]
+                        # Construct a message similar to what Binance WebSocket sends
+                        simulated_msg = {
+                            "k": kline_data, # Pass the raw kline list directly
+                            "s": symbol, # Add symbol for easier access
+                            "x": True # Indicate candle is closed
+                        }
+                        # Process the simulated message
+                        for strategy_type, pair in strategy_pairs.items():
+                            process_kline_message(
+                                simulated_msg,
+                                pair["position_manager"],
+                                pair["alligator_strategy"],
+                                pair["strong_targets"],
+                                pair["is_volume_on"]
+                            )
+        else:
+            logging.warning("No test symbols or historical data to simulate.")
+
+        # After simulating historical data, exit if not in continuous mode
+        logging.info("Historical k-line simulation complete. Exiting local test mode.")
+        return # Exit main function after simulation
 
     logging.info("Entering main processing loop...")
     last_screener_run = datetime.now()
+    last_heartbeat_time = datetime.now()
     start_time = datetime.now()
     fetched_times_today = set() # To track scheduled fetches for today
 
@@ -152,6 +207,12 @@ def main(args):
             if timeout and (datetime.now() - start_time) > timedelta(seconds=timeout):
                 logging.info(f"Timeout of {timeout} seconds reached. Exiting.")
                 break
+
+            # Heartbeat notification
+            if (datetime.now() - last_heartbeat_time) > timedelta(minutes=15):
+                for strategy_type, pair in strategy_pairs.items():
+                    notification_service.send_heartbeat_notification(is_volume_on=pair["is_volume_on"])
+                last_heartbeat_time = datetime.now()
 
             # Task 2.2: Implement scheduled fetching logic
             current_time = datetime.now()

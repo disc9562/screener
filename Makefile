@@ -4,6 +4,15 @@ install:
 run:
 	python main.py $(ARGS)
 
+run-fetch-now:
+	python main.py --fetch-now
+
+run-local-test:
+	python main.py --local-test
+
+run-local-test-fetch-now:
+	python main.py --local-test --fetch-now
+
 test:
 	pytest tests/
 

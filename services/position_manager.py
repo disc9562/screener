@@ -154,7 +154,7 @@ class PositionManager:
             if exit_price is not None:
                 self.positions_df.loc[index, 'status'] = 'CLOSED'
                 self.positions_df.loc[index, 'exit_reason'] = exit_reason
-                self.positions_df.loc[index, 'exit_timestamp'] = kline['Timestamp']
+                self.positions_df.loc[index, 'exit_timestamp'] = kline['Datetime']
                 pnl = (exit_price - position['entry_price']) * position['units']
                 # Account for closing fee
                 closing_fee = exit_price * position['units'] * self.strategy_config.get('TRANSACTION_FEE_PERCENT')

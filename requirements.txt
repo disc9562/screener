@@ -17,3 +17,4 @@ pytest
 pytest-mock
 polygon-api-client
 binance-connector
+freezegun

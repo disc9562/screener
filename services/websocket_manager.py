@@ -6,12 +6,13 @@ from binance.spot import Spot as SpotClient
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 
 class WebSocketManager:
-    def __init__(self, api_key, api_secret):
+    def __init__(self, api_key, api_secret, notification_service):
         self.ws_client = None
         self.queue = queue.Queue()
         self.logger = logging.getLogger(__name__)
         self.api_key = api_key
         self.api_secret = api_secret
+        self.notification_service = notification_service
 
     def _message_handler(self, _, message):
         """Callback function to handle incoming websocket messages."""
@@ -41,6 +42,7 @@ class WebSocketManager:
         streams = [f"{symbol.lower()}@kline_{interval}" for symbol in symbols]
         self.logger.info(f"Subscribing to streams: {streams}")
         self.ws_client.subscribe(stream=streams)
+        self.notification_service.send_subscription_notification(symbols, "initial")
 
     def subscribe(self, symbols: list, interval='15m'):
         """Subscribes to additional streams."""
@@ -55,6 +57,7 @@ class WebSocketManager:
         streams = [f"{symbol.lower()}@kline_{interval}" for symbol in symbols]
         self.logger.info(f"Subscribing to additional streams: {streams}")
         self.ws_client.subscribe(stream=streams)
+        self.notification_service.send_subscription_notification(symbols, "additional")
 
     def get_message(self, block=True, timeout=None):
         """Gets a message from the queue."""
