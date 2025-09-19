@@ -64,14 +64,7 @@ class RelativeStrengthStrategy(Strategy):
                       (moving_average_45 - moving_average_60)) / moving_average_60
             rs_score += weight * (bars - i)
 
-        if rs_score > 0: # Simple signal for now
-            return {"signal": "STRONG_RS", "score": rs_score}
-        else:
-            # For testing purposes, force STRONG_RS for BTCUSDT
-            if self.config.get('local_test_mode') and self.config.get('TEST_COIN_SUBSET') and self.config.get('TEST_COIN_SUBSET')[0] == symbol:
-                logging.debug(f"Forcing STRONG_RS for {df['symbol'].iloc[-1]} in local test mode.")
-                return {"signal": "STRONG_RS", "score": 10000.0} # Return a high score
-            return {"signal": "WEAK_RS", "score": rs_score}
+        return {"signal": "RS_SCORE", "score": rs_score}
 
     def _calc_total_bars(self, time_interval, days):
         """Helper function from crypto_relative_strength.py"""

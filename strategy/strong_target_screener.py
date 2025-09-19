@@ -58,7 +58,7 @@ class StrongTargetScreener(Strategy):
 
     def _run_strategy_on_symbols(self, strategy_instance, symbols, timeframe):
         """Helper to run a strategy on a list of symbols using ThreadPoolExecutor."""
-        strong_targets = []
+        target_scores = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.get('MAX_WORKERS', 2)) as executor:
             future_to_symbol = {}
             for symbol in symbols:
@@ -69,8 +69,11 @@ class StrongTargetScreener(Strategy):
                 symbol = future_to_symbol[future]
                 try:
                     result = future.result()
-                    if result and result.get("signal") == "STRONG_RS":
-                        strong_targets.append(symbol)
+                    if result and result.get("signal") == "RS_SCORE":
+                        target_scores[symbol] = result.get("score")
                 except Exception as exc:
                     print(f'{symbol} generated an exception: {exc}')
-        return strong_targets
+        
+        sorted_targets = sorted(target_scores.items(), key=lambda item: item[1], reverse=True)
+        
+        return sorted_targets[:20] # Return top 20 as a list of tuples (symbol, score)

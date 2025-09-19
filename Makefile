@@ -13,6 +13,9 @@ run-local-test:
 run-local-test-fetch-now:
 	python main.py --local-test --fetch-now
 
+run-scheduled:
+	python main.py
+
 test:
 	pytest tests/
 

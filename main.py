@@ -22,7 +22,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 kline_cache = {}
 
-def process_kline_message(msg, position_manager, alligator_strategy, strong_targets, is_volume_on: bool):
+def process_kline_message(msg, position_manager, alligator_strategy, strong_targets, is_volume_on: bool, notification_service: NotificationService):
+    logging.info(f"Received k-line message: {msg}")
     try:
         if msg.get('x'): # Process only closed klines (msg['x'] is now directly accessible)
             kline_data = msg['k'] # Raw kline list
@@ -57,11 +58,13 @@ def process_kline_message(msg, position_manager, alligator_strategy, strong_targ
                     last_signal = signals[-1]
                     logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {last_signal}")
                     position_manager.open_position(symbol, last_signal)
+            
+            notification_service.send_heartbeat_notification(is_volume_on=is_volume_on)
 
     except Exception as e:
         logging.error(f"Error processing kline message: {e}")
 
-def main(args):
+def run_app(args):
     logging.info("Application starting...")
     
     timeout = args.timeout
@@ -116,30 +119,51 @@ def main(args):
     screener.config['local_test_mode'] = getattr(args, 'local_test', False) # Pass local_test_mode to screener
 
     # Task 3.2: Implement --fetch-now logic
-    all_symbols_to_subscribe = set() # Initialize here to ensure it's always defined
+    top_20_targets = []
     if getattr(args, 'fetch_now', False):
         logging.info("Manual fetch triggered (--fetch-now). Bypassing schedule.")
-        for strategy_type, pair in strategy_pairs.items():
-            initial_strong_targets = set(screener.run_screener())
-            pair["strong_targets"] = initial_strong_targets
-            notification_service.send_list_change_notification(
-                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
-            )
-            all_symbols_to_subscribe.update(initial_strong_targets) # Move inside loop
-            all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols()) # Move inside loop
+        strong_targets_with_scores = screener.run_screener()
+        top_20_targets = [item[0] for item in strong_targets_with_scores]
     else:
         logging.info("Performing initial screening for strong targets (scheduled).")
-        # Run initial screening for both strategies
-        for strategy_type, pair in strategy_pairs.items():
-            initial_strong_targets = set(screener.run_screener())
-            pair["strong_targets"] = initial_strong_targets
-            notification_service.send_list_change_notification(
-                added=initial_strong_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
-            )
-            all_symbols_to_subscribe.update(initial_strong_targets) # Move inside loop
-            all_symbols_to_subscribe.update(pair["position_manager"].get_open_positions_symbols()) # Move inside loop
+        strong_targets_with_scores = screener.run_screener()
+        top_20_targets = [item[0] for item in strong_targets_with_scores]
 
-    symbols_to_subscribe = list(all_symbols_to_subscribe)
+    # Pre-fill kline_cache with historical data for the top 20 targets
+    logging.info("Pre-filling k-line cache with historical data for top 20 targets...")
+    crypto_fetcher = CryptoFetcher()
+    for symbol in top_20_targets:
+        retries = 3
+        for i in range(retries):
+            try:
+                historical_klines = crypto_fetcher.fetch_klines(symbol, '15m', limit=250)
+                if historical_klines:
+                    kline_cache[symbol] = historical_klines
+                    logging.info(f"Successfully pre-filled cache for {symbol} with {len(historical_klines)} k-lines.")
+                    break
+            except Exception as e:
+                logging.warning(f"Attempt {i+1} to fetch historical k-lines for {symbol} failed: {e}")
+                if i < retries - 1:
+                    time.sleep(5)
+                else:
+                    logging.error(f"Failed to fetch historical k-lines for {symbol} after {retries} attempts. Exiting.")
+                    sys.exit(1)
+
+    for strategy_type, pair in strategy_pairs.items():
+        pair["strong_targets"] = set(top_20_targets)
+        notification_service.send_list_change_notification(
+            added=set(top_20_targets), removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
+        )
+
+    notification_service.send_list_change_notification(
+        added=set(top_20_targets), removed=set(), webhook_type="general_targets", is_local_test=getattr(args, 'local_test', False)
+    )
+
+    symbols_to_subscribe = top_20_targets
+    for strategy_type, pair in strategy_pairs.items():
+        symbols_to_subscribe.extend(pair["position_manager"].get_open_positions_symbols())
+    symbols_to_subscribe = list(set(symbols_to_subscribe))
+
 
     # Task 3.1: Disable WebSocket connection in local test mode
     if not getattr(args, 'local_test', False):
@@ -186,7 +210,8 @@ def main(args):
                                 pair["position_manager"],
                                 pair["alligator_strategy"],
                                 pair["strong_targets"],
-                                pair["is_volume_on"]
+                                pair["is_volume_on"],
+                                notification_service
                             )
         else:
             logging.warning("No test symbols or historical data to simulate.")
@@ -197,7 +222,6 @@ def main(args):
 
     logging.info("Entering main processing loop...")
     last_screener_run = datetime.now()
-    last_heartbeat_time = datetime.now()
     start_time = datetime.now()
     fetched_times_today = set() # To track scheduled fetches for today
 
@@ -207,12 +231,6 @@ def main(args):
             if timeout and (datetime.now() - start_time) > timedelta(seconds=timeout):
                 logging.info(f"Timeout of {timeout} seconds reached. Exiting.")
                 break
-
-            # Heartbeat notification
-            if (datetime.now() - last_heartbeat_time) > timedelta(minutes=15):
-                for strategy_type, pair in strategy_pairs.items():
-                    notification_service.send_heartbeat_notification(is_volume_on=pair["is_volume_on"])
-                last_heartbeat_time = datetime.now()
 
             # Task 2.2: Implement scheduled fetching logic
             current_time = datetime.now()
@@ -228,8 +246,11 @@ def main(args):
                     (today_str, fetch_time_str) not in fetched_times_today):
                     
                     logging.info(f"Scheduled re-running screener for {fetch_time_str}...")
+                    strong_targets_with_scores = screener.run_screener()
+                    top_20_targets = [item[0] for item in strong_targets_with_scores]
+
                     for strategy_type, pair in strategy_pairs.items():
-                        new_strong_targets = set(screener.run_screener())
+                        new_strong_targets = set(top_20_targets)
                         
                         current_symbols = pair["strong_targets"]
                         added = new_strong_targets - current_symbols
@@ -245,12 +266,13 @@ def main(args):
                             notification_service.send_list_change_notification(
                                 added=added, removed=removed, is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False)
                             )
-                    # Send general strong targets notification
+                        pair["strong_targets"] = new_strong_targets
+
+                    # Send general strong targets notification with only top 20
                     notification_service.send_list_change_notification(
-                        added=all_symbols_to_subscribe, removed=set(), webhook_type="general_targets", is_local_test=getattr(args, 'local_test', False)
+                        added=set(top_20_targets), removed=set(), webhook_type="general_targets", is_local_test=getattr(args, 'local_test', False)
                     )
                     
-                    pair["strong_targets"] = new_strong_targets
                     fetched_times_today.add((today_str, fetch_time_str)) # Mark as fetched for today
 
             if not getattr(args, 'local_test', False): # Only process WebSocket messages if not in local test mode
@@ -264,7 +286,8 @@ def main(args):
                                 pair["position_manager"],
                                 pair["alligator_strategy"],
                                 pair["strong_targets"],
-                                pair["is_volume_on"] # Pass is_volume_on to process_kline_message
+                                pair["is_volume_on"],
+                                notification_service
                             )
                 except queue.Empty:
                     continue
@@ -277,10 +300,13 @@ def main(args):
             ws_manager.stop()
         logging.info("Application stopped.")
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Crypto Screener Bot")
     parser.add_argument('--timeout', type=int, help='Timeout in seconds for debug mode.')
     parser.add_argument('--fetch-now', action='store_true', help='Immediately fetch strong targets, bypassing schedule.')
     parser.add_argument('--local-test', action='store_true', help='Enable local test mode (e.g., subset of coins, no WebSocket).')
     args = parser.parse_args()
-    main(args)
+    run_app(args)
+
+if __name__ == "__main__":
+    main()
