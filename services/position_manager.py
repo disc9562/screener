@@ -48,11 +48,15 @@ class PositionManager:
         """
         Returns a list of symbols for all positions with 'OPEN' status.
         """
+        logging.info(f"DEBUG_PM ({self.csv_path}): Getting open positions. Current DF:\n{self.positions_df}")
         if self.positions_df.empty or 'status' not in self.positions_df.columns:
+            logging.info(f"DEBUG_PM ({self.csv_path}): DataFrame is empty, returning [].")
             return []
         
         open_positions = self.positions_df[self.positions_df['status'] == 'OPEN']
-        return open_positions['symbol'].unique().tolist()
+        symbols = open_positions['symbol'].unique().tolist()
+        logging.info(f"DEBUG_PM ({self.csv_path}): Found open positions for symbols: {symbols}")
+        return symbols
 
     def open_position(self, symbol: str, signal: dict):
         """
@@ -108,6 +112,7 @@ class PositionManager:
         
         new_pos_df = pd.DataFrame([new_position])
         self.positions_df = pd.concat([self.positions_df, new_pos_df], ignore_index=True)
+        logging.info(f"DEBUG_PM ({self.csv_path}): DataFrame after adding new position for {symbol}:\n{self.positions_df}")
         
         self._save_positions()
         logging.info(f"Opened new position for {symbol} at {new_position['entry_price']}.")
@@ -117,7 +122,8 @@ class PositionManager:
             action="BUY",
             price=new_position['entry_price'],
             units=new_position['units'],
-            stop_loss_price=new_position['stop_loss']
+            stop_loss_price=new_position['stop_loss'],
+            is_volume_on=self.strategy_config.get('use_volume_condition', False)
         )
         return True
 
@@ -169,7 +175,8 @@ class PositionManager:
                     price=exit_price,
                     units=position['units'],
                     reason=exit_reason,
-                    pnl=pnl
+                    pnl=pnl,
+                    is_volume_on=self.strategy_config.get('use_volume_condition', False)
                 )
             else:
                 # Calculate floating PnL from price change

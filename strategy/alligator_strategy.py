@@ -69,9 +69,7 @@ class AlligatorStrategy(Strategy):
         if use_volume_condition:
             volume_multiplier = self.config.get('volume_multiplier', 2.5)
             volume_condition = df['Volume'] > (df['Volume'].shift(1) * volume_multiplier)
-            # Temporarily bypass volume condition for testing
-            # long_condition = base_condition & volume_condition
-            long_condition = base_condition
+            long_condition = base_condition & volume_condition
         
         
         

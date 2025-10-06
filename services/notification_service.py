@@ -98,11 +98,14 @@ class NotificationService:
         message = f"Successfully subscribed to {subscription_type} k-line streams for: {symbols_str}"
         self._send_embed_notification(embed=None, webhook_type='general_targets', content=message)
 
-    def send_heartbeat_notification(self, is_volume_on: bool = None):
+    def send_heartbeat_notification(self, is_volume_on: bool = None, message: str = None):
         """Sends a heartbeat notification to indicate the bot is running."""
-        message = "Heartbeat: No new positions opened in the last 15 minutes. The bot is running."
+        content = message if message is not None else "Heartbeat: Bot is alive and running."
         if is_volume_on is None:
-            webhook_type = 'general_targets'
+            # If no specific strategy is mentioned, send to both for a general heartbeat.
+            self._send_embed_notification(embed=None, webhook_type='volume_on', content=content)
+            self._send_embed_notification(embed=None, webhook_type='volume_off', content=content)
         else:
+            # If a specific strategy is mentioned, send only to that one.
             webhook_type = "volume_on" if is_volume_on else "volume_off"
-        self._send_embed_notification(embed=None, webhook_type=webhook_type, content=message)
+            self._send_embed_notification(embed=None, webhook_type=webhook_type, content=content)

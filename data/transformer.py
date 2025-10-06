@@ -12,10 +12,11 @@ def transform_crypto_data(raw_klines, timezone_str="America/Los_Angeles"):
                                            "Volume", "Close Time", "Quote Volume", "Number of Trades",
                                            "Taker buy base asset volume", "Taker buy quote asset volume", "Ignore"])
 
-    # Select and convert data types
+    # Select and convert data types, ensuring high precision for price columns
     df = df[["Datetime", "Open", "High", "Low", "Close", "Volume"]]
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        df[col] = pd.to_numeric(df[col])
+    for col in ["Open", "High", "Low", "Close"]:
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype(float)
+    df["Volume"] = pd.to_numeric(df["Volume"], errors='coerce').astype(float)
 
     # Handle timestamp and timezone
     local_timezone = pytz.timezone(timezone_str)

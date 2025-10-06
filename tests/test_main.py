@@ -5,6 +5,7 @@ import sys
 import os
 import argparse
 import queue
+import gc
 
 # Add the project root to the sys.path to allow imports from config, services, etc.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -58,6 +59,12 @@ def clear_kline_cache():
     import main
     main.kline_cache = {}
     yield
+
+@pytest.fixture(autouse=True)
+def cleanup_memory():
+    """Fixture to clean up memory after each test."""
+    yield
+    gc.collect()
 
 
 @patch('main.run_app')

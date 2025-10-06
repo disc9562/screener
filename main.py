@@ -22,62 +22,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 kline_cache = {}
 
-def process_kline_message(msg, position_manager, alligator_strategy, strong_targets, is_volume_on: bool, notification_service: NotificationService):
-    logging.info(f"Received k-line message: {msg}")
+def process_kline_message(df, symbol, position_manager, alligator_strategy, strong_targets, is_volume_on: bool, notification_service: NotificationService):
+    """Processes a single DataFrame for a given strategy."""
     try:
-        if msg.get('x'): # Process only closed klines (msg['x'] is now directly accessible)
-            kline_data = msg['k'] # Raw kline list
-            symbol = msg['s'] # Symbol is now directly accessible
-            
-            
-            if symbol not in kline_cache:
-                kline_cache[symbol] = []
-            kline_cache[symbol].append(kline_data)
-            if len(kline_cache[symbol]) > 500:
-                kline_cache[symbol].pop(0)
-            
+        if df.empty:
+            return
 
-            df = transform_crypto_data(kline_cache[symbol])
-            
-            if not df.empty:
-                pass
-                
-            if df.empty:
-                return
-
-            position_manager.update_positions({symbol: df.iloc[-1]})
-            
-            
-            if symbol in strong_targets: # This condition is now met for BTCUSDT
-                
-                # Pass is_volume_on to run_with_existing_data if it needs to be used there
-                # For now, AlligatorStrategy uses its own config, so no need to pass here
-                
-                signals = alligator_strategy.run_with_existing_data(df)
-                if signals:
-                    last_signal = signals[-1]
+        position_manager.update_positions({symbol: df.iloc[-1]})
+        
+        if symbol in strong_targets:
+            signals = alligator_strategy.run_with_existing_data(df)
+            if signals:
+                last_signal = signals[-1]
+                if symbol not in position_manager.get_open_positions_symbols():
                     logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {last_signal}")
                     position_manager.open_position(symbol, last_signal)
-            
-            notification_service.send_heartbeat_notification(is_volume_on=is_volume_on)
+                else:
+                    logging.info(f"Position for {symbol} is already open. Ignoring new BUY signal.")
 
     except Exception as e:
-        logging.error(f"Error processing kline message: {e}")
+        logging.error(f"Error in process_kline_message for {symbol}: {e}", exc_info=True)
 
 def run_app(args):
     logging.info("Application starting...")
-    
-    timeout = args.timeout
-
-    strategy_config = get_strategy_config()
 
     # AC5: Strict Webhook Configuration Validation
+    strategy_config = get_strategy_config()
     webhook_on = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_ON")
     webhook_off = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_OFF")
-
     if not webhook_on or not webhook_off:
         logging.error("Error: Both DISCORD_WEBHOOK_URL_VOLUME_ON and DISCORD_WEBHOOK_URL_VOLUME_OFF must be configured in .env")
-        sys.exit(1) # Exit the application
+        sys.exit(1)
 
     webhook_urls_map = {
         "volume_on": webhook_on,
@@ -86,17 +61,24 @@ def run_app(args):
     }
     notification_service = NotificationService(webhook_urls_map=webhook_urls_map)
 
+    # Initial Heartbeat Check on Startup
+    if datetime.now().minute % 15 == 0:
+        logging.info("STARTUP_HEARTBEAT: Sending initial no-position heartbeat.")
+        notification_service.send_heartbeat_notification(message="程式已啟動，目前無倉位")
+    
+    timeout = args.timeout
+
     # Task 5.1: Instantiate two strategy/position manager pairs
     # Strategy 1: Volume ON
     strategy_config_volume_on = strategy_config.copy()
     strategy_config_volume_on["use_volume_condition"] = True
-    position_manager_volume_on = PositionManager(notification_service=notification_service, strategy_config=strategy_config_volume_on)
+    position_manager_volume_on = PositionManager(notification_service=notification_service, strategy_config=strategy_config_volume_on, csv_path='data/positions_volume_on.csv')
     alligator_strategy_volume_on = AlligatorStrategy(strategy_config_volume_on)
 
     # Strategy 2: Volume OFF
     strategy_config_volume_off = strategy_config.copy()
     strategy_config_volume_off["use_volume_condition"] = False
-    position_manager_volume_off = PositionManager(notification_service=notification_service, strategy_config=strategy_config_volume_off)
+    position_manager_volume_off = PositionManager(notification_service=notification_service, strategy_config=strategy_config_volume_off, csv_path='data/positions_volume_off.csv')
     alligator_strategy_volume_off = AlligatorStrategy(strategy_config_volume_off)
 
     # Store strategy pairs in a dictionary for easier iteration
@@ -221,9 +203,9 @@ def run_app(args):
         return # Exit main function after simulation
 
     logging.info("Entering main processing loop...")
-    last_screener_run = datetime.now()
     start_time = datetime.now()
-    fetched_times_today = set() # To track scheduled fetches for today
+    fetched_times_today = set()
+    last_heartbeat_minute = -1 # Initialize with a value that won't match any minute
 
     try:
         while True:
@@ -231,6 +213,16 @@ def run_app(args):
             if timeout and (datetime.now() - start_time) > timedelta(seconds=timeout):
                 logging.info(f"Timeout of {timeout} seconds reached. Exiting.")
                 break
+
+            # Heartbeat notification using a more robust minute-check logic
+            current_minute = datetime.now().minute
+            if current_minute % 15 == 0:
+                positions_on = position_manager_volume_on.get_open_positions_symbols()
+                positions_off = position_manager_volume_off.get_open_positions_symbols()
+
+                if not positions_on and not positions_off:
+                    logging.info("HEARTBEAT_CHECK: No open positions found. Sending notifications...")
+                    notification_service.send_heartbeat_notification(message="沒有艙位")
 
             # Task 2.2: Implement scheduled fetching logic
             current_time = datetime.now()
@@ -275,14 +267,28 @@ def run_app(args):
                     
                     fetched_times_today.add((today_str, fetch_time_str)) # Mark as fetched for today
 
-            if not getattr(args, 'local_test', False): # Only process WebSocket messages if not in local test mode
+            if not getattr(args, 'local_test', False):
                 try:
                     message = ws_manager.get_message(block=True, timeout=1)
                     if message:
-                        # Process kline message for each strategy
+                        kline_data = message['k']
+                        symbol = message['s']
+
+                        # Update cache once per message
+                        if symbol not in kline_cache:
+                            kline_cache[symbol] = []
+                        kline_cache[symbol].append(kline_data)
+                        if len(kline_cache[symbol]) > 500:
+                            kline_cache[symbol].pop(0)
+
+                        # Create DataFrame once per message
+                        df = transform_crypto_data(kline_cache[symbol])
+
+                        # Process the single DataFrame for each strategy
                         for strategy_type, pair in strategy_pairs.items():
                             process_kline_message(
-                                message,
+                                df, # Pass the transformed DataFrame
+                                symbol, # Pass the symbol
                                 pair["position_manager"],
                                 pair["alligator_strategy"],
                                 pair["strong_targets"],
