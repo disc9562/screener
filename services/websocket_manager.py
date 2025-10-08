@@ -115,8 +115,13 @@ class WebSocketManager:
         self.symbols.extend(new_symbols)
         streams = [f"{symbol.lower()}@kline_{self.interval}" for symbol in new_symbols]
         self.logger.info(f"Subscribing to additional streams: {streams}")
-        self.ws_client.subscribe(stream=streams)
-        self.notification_service.send_subscription_notification(new_symbols, "additional")
+        try:
+            self.ws_client.subscribe(stream=streams)
+            self.notification_service.send_subscription_notification(new_symbols, "additional")
+        except WebSocketConnectionClosedException:
+            self.logger.error("Failed to subscribe to new symbols because the WebSocket connection is closed. The manager will attempt to reconnect automatically.")
+        except Exception as e:
+            self.logger.error(f"An unexpected error occurred during subscription: {e}")
 
     def get_message(self, block=True, timeout=None):
         """Gets a message from the queue."""
