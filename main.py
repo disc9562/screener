@@ -5,7 +5,7 @@ import logging
 import queue
 import argparse
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock # Added for local test mode
+import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 

@@ -2,9 +2,10 @@ import logging
 import pandas as pd
 from strategy.base import Strategy
 
-class AlligatorStrategy(Strategy):
+class AlligatorStrategy:
     def __init__(self, config):
-        super().__init__(config)
+        self.config = config
+        self.logger = logging.getLogger(__name__)
         self.smma_values = {}
         self.periods = [10, 20, 50, 233]
 
