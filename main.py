@@ -125,23 +125,63 @@ def run_app(args):
 
     logging.info("Entering main processing loop...")
     last_heartbeat_minute = -1
+    fetched_times_today = set()
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
     try:
         while True:
-            current_minute = datetime.now().minute
+            now = datetime.now()
+            # Reset fetched times at the start of a new day
+            current_day_str = now.strftime("%Y-%m-%d")
+            if current_day_str != today_str:
+                fetched_times_today = set()
+                today_str = current_day_str
+                logging.info("New day, resetting scheduled fetch times.")
+
+            # Scheduled re-screening logic
+            for fetch_time_str in strategy_config.get("TARGET_FETCH_TIMES", []):
+                fetch_hour, fetch_minute = map(int, fetch_time_str.split(':'))
+                if now.hour == fetch_hour and now.minute == fetch_minute and (today_str, fetch_time_str) not in fetched_times_today:
+                    logging.info(f"Scheduled re-running screener for {fetch_time_str}...")
+                    strong_targets_with_scores = screener.run_screener()
+                    new_top_20_targets = {item[0] for item in strong_targets_with_scores}
+
+                    for pair in strategy_pairs.values():
+                        current_symbols = pair["strong_targets"]
+                        added = new_top_20_targets - current_symbols
+                        removed = current_symbols - new_top_20_targets
+                        
+                        if added:
+                            logging.info(f"New symbols to subscribe to for strategy: {added}")
+                            ws_manager.subscribe(list(added))
+                        
+                        if added or removed:
+                            notification_service.send_list_change_notification(
+                                added=added, removed=removed, is_volume_on=pair["is_volume_on"], is_local_test=False
+                            )
+                        pair["strong_targets"] = new_top_20_targets
+
+                    notification_service.send_list_change_notification(
+                        added=new_top_20_targets, removed=set(), webhook_type="general_targets", is_local_test=False
+                    )
+                    
+                    fetched_times_today.add((today_str, fetch_time_str))
+
+            # Heartbeat notification
+            current_minute = now.minute
             if current_minute % 15 == 0 and current_minute != last_heartbeat_minute:
                 if not position_manager_volume_on.get_open_positions_symbols() and not position_manager_volume_off.get_open_positions_symbols():
                     logging.info("HEARTBEAT_CHECK: No open positions. Sending notification.")
                     notification_service.send_heartbeat_notification(message="沒有艙位")
                 last_heartbeat_minute = current_minute
 
+            # Process WebSocket messages
             try:
-                message = ws_manager.get_message(block=True, timeout=1)
+                message = ws_manager.get_message(block=False) # Use non-blocking get
                 if message:
                     kline = message['k']
                     symbol = message['s']
                     
-                    # Process the kline for each strategy pair
                     for pair in strategy_pairs.values():
                         process_kline_message(
                             symbol,
@@ -152,7 +192,9 @@ def run_app(args):
                             pair["is_volume_on"]
                         )
             except queue.Empty:
-                continue
+                pass # It's okay if there are no messages
+            
+            time.sleep(1) # Prevent high CPU usage
 
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")
