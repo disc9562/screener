@@ -24,8 +24,7 @@ def process_kline_message(symbol: str, kline: dict, position_manager: PositionMa
     """Processes a single kline for a given strategy in a stateful manner."""
     try:
         # 1. Update position status with the latest price from the kline
-        # Note: The kline from websocket is a list, but update_positions expects a dict-like object.
-        # We create a small DataFrame for compatibility.
+        # Create a DataFrame for position manager compatibility
         latest_price_df = pd.DataFrame([{
             'Datetime': pd.to_datetime(kline['t'], unit='ms'),
             'High': float(kline['h']),

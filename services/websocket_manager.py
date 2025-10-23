@@ -32,14 +32,9 @@ class WebSocketManager:
             # Only queue the message if it's a closed k-line
             if data.get('k', {}).get('x'):
                 kline_data = data['k']
-                # Extract and order k-line data into a list format expected by transform_crypto_data
-                formatted_kline = [
-                    kline_data['t'], kline_data['o'], kline_data['h'], kline_data['l'], kline_data['c'],
-                    kline_data['v'], kline_data['T'], kline_data['q'], kline_data['n'], kline_data['V'],
-                    kline_data['Q'], kline_data['B']
-                ]
+                # Keep kline in dict format for use in main.py and alligator_strategy.py
                 self.logger.info(f"Queuing closed k-line for {data.get('s')}")
-                self.queue.put({'k': formatted_kline, 's': data.get('s')}) # Put formatted kline and symbol
+                self.queue.put({'k': kline_data, 's': data.get('s')}) # Put kline dict and symbol
 
         except Exception as e:
             self.logger.error(f"Error processing websocket message: {e}")
