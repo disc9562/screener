@@ -4,10 +4,11 @@ import logging
 from services.notification_service import NotificationService
 
 class PositionManager:
-    def __init__(self, notification_service: NotificationService, strategy_config: dict, csv_path='data/positions.csv'):
+    def __init__(self, notification_service: NotificationService, strategy_config: dict, csv_path='data/positions.csv', order_execution_service=None):
         self.csv_path = csv_path
         self.notification_service = notification_service
         self.strategy_config = strategy_config # Store the strategy config
+        self.order_execution_service = order_execution_service
         self.positions_df = self._load_positions()
         
 
@@ -116,14 +117,33 @@ class PositionManager:
         
         self._save_positions()
         logging.info(f"Opened new position for {symbol} at {new_position['entry_price']}.")
-        
+
+        # Execute orders on testnet if enabled
+        testnet_orders = None
+        if self.order_execution_service:
+            try:
+                entry_order = self.order_execution_service.place_market_order(symbol, 'BUY', units)
+                if entry_order:
+                    sl_order = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop_loss)
+                    tp_order = self.order_execution_service.place_take_profit_order(symbol, 'SELL', units, take_profit)
+                    testnet_orders = {
+                        'entry': entry_order,
+                        'stop_loss': sl_order,
+                        'take_profit': tp_order,
+                    }
+                else:
+                    logging.warning(f"Testnet market order failed for {symbol}, skipping SL/TP orders")
+            except Exception as e:
+                logging.error(f"Testnet order execution error for {symbol}: {e}")
+
         self.notification_service.send_trade_notification(
             symbol=symbol,
             action="BUY",
             price=new_position['entry_price'],
             units=new_position['units'],
             stop_loss_price=new_position['stop_loss'],
-            is_volume_on=self.strategy_config.get('use_volume_condition', False)
+            is_volume_on=self.strategy_config.get('use_volume_condition', False),
+            testnet_orders=testnet_orders,
         )
         return True
 
@@ -168,7 +188,17 @@ class PositionManager:
                 self.positions_df.loc[index, 'pnl'] = pnl
                 logging.info(f"Closed position for {symbol} by {exit_reason}. PnL: {pnl:.2f}")
                 positions_updated = True
-                
+
+                # Close position on testnet if enabled
+                testnet_orders = None
+                if self.order_execution_service:
+                    try:
+                        close_order = self.order_execution_service.close_position(symbol, position['units'])
+                        if close_order:
+                            testnet_orders = {'close': close_order}
+                    except Exception as e:
+                        logging.error(f"Testnet close position error for {symbol}: {e}")
+
                 self.notification_service.send_trade_notification(
                     symbol=symbol,
                     action="SELL",
@@ -176,7 +206,8 @@ class PositionManager:
                     units=position['units'],
                     reason=exit_reason,
                     pnl=pnl,
-                    is_volume_on=self.strategy_config.get('use_volume_condition', False)
+                    is_volume_on=self.strategy_config.get('use_volume_condition', False),
+                    testnet_orders=testnet_orders,
                 )
             else:
                 # Calculate floating PnL from price change

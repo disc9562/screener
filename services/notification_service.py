@@ -27,12 +27,13 @@ class NotificationService:
         except Exception as e:
             logging.error(f"Error sending Discord notification for type '{webhook_type}': {e}")
 
-    def send_trade_notification(self, symbol, action, price, units, reason=None, pnl=None, stop_loss_price=None, is_volume_on: bool = False):
+    def send_trade_notification(self, symbol, action, price, units, reason=None, pnl=None, stop_loss_price=None, is_volume_on: bool = False, testnet_orders: dict = None):
         """Formats and sends a trade event notification."""
         # AC4: Add identification to notification content
         strategy_tag = "[Volume ON]" if is_volume_on else "[Volume OFF]"
+        testnet_tag = " [TESTNET]" if testnet_orders else ""
         message_parts = [
-            f"Trade Executed {strategy_tag}: {action.upper()} {symbol}",
+            f"Trade Executed {strategy_tag}{testnet_tag}: {action.upper()} {symbol}",
             f"Price: {price:.4f}",
             f"Units: {units:.4f}"
         ]
@@ -42,9 +43,27 @@ class NotificationService:
             message_parts.append(f"Reason: {reason}")
         if pnl is not None:
             message_parts.append(f"Profit/Loss: {pnl:.2f} USD")
-        
+
+        # Append testnet order details
+        if testnet_orders:
+            message_parts.append("--- Testnet Orders ---")
+            entry = testnet_orders.get('entry')
+            if entry:
+                fill_price = entry.get('avgPrice', entry.get('price', 'N/A'))
+                message_parts.append(f"Entry: orderId={entry.get('orderId')} status={entry.get('status')} avgPrice={fill_price}")
+            sl = testnet_orders.get('stop_loss')
+            if sl:
+                message_parts.append(f"Stop Loss: orderId={sl.get('orderId')} stopPrice={sl.get('stopPrice', 'N/A')} status={sl.get('status')}")
+            tp = testnet_orders.get('take_profit')
+            if tp:
+                message_parts.append(f"Take Profit: orderId={tp.get('orderId')} stopPrice={tp.get('stopPrice', 'N/A')} status={tp.get('status')}")
+            close = testnet_orders.get('close')
+            if close:
+                fill_price = close.get('avgPrice', close.get('price', 'N/A'))
+                message_parts.append(f"Close: orderId={close.get('orderId')} status={close.get('status')} avgPrice={fill_price}")
+
         content = "\n".join(message_parts)
-        
+
         webhook_type = "volume_on" if is_volume_on else "volume_off"
         self._send_embed_notification(embed=None, webhook_type=webhook_type, content=content) # Pass content, embed is None
 

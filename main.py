@@ -9,7 +9,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-from config import get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET
+from config import get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET, USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET
 from data.transformer import transform_crypto_data
 from data.fetcher import CryptoFetcher
 from strategy.strong_target_screener import StrongTargetScreener
@@ -17,6 +17,7 @@ from strategy.alligator_strategy import AlligatorStrategy
 from services.position_manager import PositionManager
 from services.websocket_manager import WebSocketManager
 from services.notification_service import NotificationService
+from services.order_execution_service import OrderExecutionService
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='application.log', filemode='w')
 
@@ -66,13 +67,27 @@ def run_app(args):
     
     timeout = args.timeout
 
+    # Initialize testnet order execution if enabled
+    order_execution_service = None
+    if USE_TESTNET:
+        if BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET:
+            try:
+                order_execution_service = OrderExecutionService(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET)
+            except Exception as e:
+                logging.error(f"Failed to initialize OrderExecutionService: {e}")
+                logging.warning("Continuing without testnet order execution.")
+        else:
+            logging.warning("USE_TESTNET is enabled but BINANCE_TESTNET_API_KEY/SECRET not set. Running without order execution.")
+    else:
+        logging.info("Testnet order execution DISABLED (paper trading mode)")
+
     # Instantiate two strategy/position manager pairs
     strategy_config_volume_on = {**strategy_config, "use_volume_condition": True}
-    position_manager_volume_on = PositionManager(notification_service, strategy_config_volume_on, 'data/positions_volume_on.csv')
+    position_manager_volume_on = PositionManager(notification_service, strategy_config_volume_on, 'data/positions_volume_on.csv', order_execution_service=order_execution_service)
     alligator_strategy_volume_on = AlligatorStrategy(strategy_config_volume_on)
 
     strategy_config_volume_off = {**strategy_config, "use_volume_condition": False}
-    position_manager_volume_off = PositionManager(notification_service, strategy_config_volume_off, 'data/positions_volume_off.csv')
+    position_manager_volume_off = PositionManager(notification_service, strategy_config_volume_off, 'data/positions_volume_off.csv', order_execution_service=order_execution_service)
     alligator_strategy_volume_off = AlligatorStrategy(strategy_config_volume_off)
 
     strategy_pairs = {
