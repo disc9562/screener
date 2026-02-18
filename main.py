@@ -4,12 +4,16 @@ import time
 import logging
 import queue
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime
+
 import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
-from config import get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET, USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET
+from config import (
+    get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET,
+    USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET,
+)
 from data.transformer import transform_crypto_data
 from data.fetcher import CryptoFetcher
 from strategy.strong_target_screener import StrongTargetScreener
@@ -21,33 +25,47 @@ from services.order_execution_service import OrderExecutionService
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='application.log', filemode='w')
 
-def process_kline_message(symbol: str, kline: dict, position_manager: PositionManager, alligator_strategy: AlligatorStrategy, strong_targets: set, is_volume_on: bool):
+
+def process_kline_message(symbol: str, kline: dict, position_manager: PositionManager,
+                          alligator_strategy: AlligatorStrategy, strong_targets: set,
+                          is_volume_on: bool):
     """Processes a single kline for a given strategy in a stateful manner."""
     try:
-        # 1. Update position status with the latest price from the kline
-        # Create a DataFrame for position manager compatibility
-        latest_price_df = pd.DataFrame([{
+        latest_price = pd.Series({
             'Datetime': pd.to_datetime(kline['t'], unit='ms'),
             'High': float(kline['h']),
             'Low': float(kline['l']),
-            'Close': float(kline['c'])
-        }])
-        position_manager.update_positions({symbol: latest_price_df.iloc[0]})
+            'Close': float(kline['c']),
+        })
+        position_manager.update_positions({symbol: latest_price})
 
-        # 2. If the symbol is a strong target, run the stateful strategy
-        if symbol in strong_targets:
-            signal = alligator_strategy.run_with_kline(symbol, kline)
-            
-            # 3. If a signal is generated, attempt to open a position
-            if signal:
-                if symbol not in position_manager.get_open_positions_symbols():
-                    logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {signal}")
-                    position_manager.open_position(symbol, signal)
-                else:
-                    logging.info(f"Position for {symbol} is already open. Ignoring new BUY signal.")
+        if symbol not in strong_targets:
+            return
+
+        signal = alligator_strategy.run_with_kline(symbol, kline)
+        if signal and symbol not in position_manager.get_open_positions_symbols():
+            logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {signal}")
+            position_manager.open_position(symbol, signal)
 
     except Exception as e:
         logging.error(f"Error in process_kline_message for {symbol}: {e}", exc_info=True)
+
+
+def _init_order_execution_service():
+    """Initialize testnet order execution if enabled and configured."""
+    if not USE_TESTNET:
+        logging.info("Testnet order execution DISABLED (paper trading mode)")
+        return None
+    if not BINANCE_TESTNET_API_KEY or not BINANCE_TESTNET_API_SECRET:
+        logging.warning("USE_TESTNET is enabled but BINANCE_TESTNET_API_KEY/SECRET not set. Running without order execution.")
+        return None
+    try:
+        return OrderExecutionService(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET)
+    except Exception as e:
+        logging.error(f"Failed to initialize OrderExecutionService: {e}")
+        logging.warning("Continuing without testnet order execution.")
+        return None
+
 
 def run_app(args):
     logging.info("Application starting...")
@@ -62,24 +80,10 @@ def run_app(args):
     notification_service = NotificationService(webhook_urls_map={
         "volume_on": webhook_on,
         "volume_off": webhook_off,
-        "general_targets": strategy_config.get("DISCORD_WEBHOOK_URL_GENERAL_TARGETS")
+        "general_targets": strategy_config.get("DISCORD_WEBHOOK_URL_GENERAL_TARGETS"),
     })
-    
-    timeout = args.timeout
 
-    # Initialize testnet order execution if enabled
-    order_execution_service = None
-    if USE_TESTNET:
-        if BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET:
-            try:
-                order_execution_service = OrderExecutionService(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET)
-            except Exception as e:
-                logging.error(f"Failed to initialize OrderExecutionService: {e}")
-                logging.warning("Continuing without testnet order execution.")
-        else:
-            logging.warning("USE_TESTNET is enabled but BINANCE_TESTNET_API_KEY/SECRET not set. Running without order execution.")
-    else:
-        logging.info("Testnet order execution DISABLED (paper trading mode)")
+    order_execution_service = _init_order_execution_service()
 
     # Instantiate two strategy/position manager pairs
     strategy_config_volume_on = {**strategy_config, "use_volume_condition": True}
@@ -102,22 +106,20 @@ def run_app(args):
     strong_targets_with_scores = screener.run_screener()
     top_20_targets = {item[0] for item in strong_targets_with_scores}
 
-    # --- Warmup Phase ---
     logging.info("Starting warmup phase for strategies...")
     crypto_fetcher = CryptoFetcher()
     for symbol in top_20_targets:
         try:
             historical_klines = crypto_fetcher.fetch_klines(symbol, '15m', limit=250)
-            if historical_klines:
-                historical_df = transform_crypto_data(historical_klines)
-                if not historical_df.empty:
-                    # Warm up both strategies with the same historical data
-                    alligator_strategy_volume_on.warmup(symbol, historical_df)
-                    alligator_strategy_volume_off.warmup(symbol, historical_df)
-                else:
-                    logging.warning(f"Could not generate DataFrame for {symbol} during warmup.")
-            else:
+            if not historical_klines:
                 logging.warning(f"No historical k-lines found for {symbol} during warmup.")
+                continue
+            historical_df = transform_crypto_data(historical_klines)
+            if historical_df.empty:
+                logging.warning(f"Could not generate DataFrame for {symbol} during warmup.")
+                continue
+            for pair in strategy_pairs.values():
+                pair["alligator_strategy"].warmup(symbol, historical_df)
         except Exception as e:
             logging.error(f"Failed to fetch/warmup for {symbol}: {e}", exc_info=True)
 
@@ -127,9 +129,10 @@ def run_app(args):
         notification_service.send_list_change_notification(added=top_20_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False))
     notification_service.send_list_change_notification(added=top_20_targets, removed=set(), webhook_type="general_targets", is_local_test=getattr(args, 'local_test', False))
 
-    symbols_to_subscribe = list(top_20_targets.union(position_manager_volume_on.get_open_positions_symbols(), position_manager_volume_off.get_open_positions_symbols()))
+    open_symbols_on = set(position_manager_volume_on.get_open_positions_symbols())
+    open_symbols_off = set(position_manager_volume_off.get_open_positions_symbols())
+    symbols_to_subscribe = list(top_20_targets | open_symbols_on | open_symbols_off)
 
-    # --- Main Processing Loop ---
     if getattr(args, 'local_test', False):
         logging.warning("Local test mode is not supported with the new stateful architecture. Exiting.")
         return
@@ -189,26 +192,23 @@ def run_app(args):
                     notification_service.send_heartbeat_notification(message="沒有艙位")
                 last_heartbeat_minute = current_minute
 
-            # Process WebSocket messages
             try:
-                message = ws_manager.get_message(block=False) # Use non-blocking get
+                message = ws_manager.get_message(block=False)
                 if message:
                     kline = message['k']
                     symbol = message['s']
-                    
                     for pair in strategy_pairs.values():
                         process_kline_message(
-                            symbol,
-                            kline,
+                            symbol, kline,
                             pair["position_manager"],
                             pair["alligator_strategy"],
                             pair["strong_targets"],
-                            pair["is_volume_on"]
+                            pair["is_volume_on"],
                         )
             except queue.Empty:
-                pass # It's okay if there are no messages
-            
-            time.sleep(1) # Prevent high CPU usage
+                pass
+
+            time.sleep(1)
 
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")

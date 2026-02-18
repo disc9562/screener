@@ -1,7 +1,35 @@
 import pytest
+import pandas as pd
 from unittest.mock import patch, MagicMock
 from binance.exceptions import BinanceAPIException
 from services.order_execution_service import OrderExecutionService
+from services.position_manager import PositionManager
+
+
+class MockNotification:
+    """Stub notification service that swallows all calls."""
+    def send_trade_notification(self, *args, **kwargs):
+        pass
+
+
+BTCUSDT_EXCHANGE_INFO = {
+    'symbols': [{
+        'symbol': 'BTCUSDT',
+        'quantityPrecision': 3,
+        'pricePrecision': 2,
+        'filters': [
+            {'filterType': 'LOT_SIZE', 'stepSize': '0.001'},
+            {'filterType': 'PRICE_FILTER', 'tickSize': '0.01'},
+        ],
+    }],
+}
+
+DEFAULT_STRATEGY_CONFIG = {
+    'TOTAL_CAPITAL': 10000.0,
+    'RISK_PER_TRADE_PERCENT': 0.01,
+    'TRANSACTION_FEE_PERCENT': 0.0006,
+    'use_volume_condition': False,
+}
 
 
 @pytest.fixture
@@ -10,25 +38,10 @@ def mock_client():
     with patch('services.order_execution_service.Client') as MockClient:
         instance = MagicMock()
         MockClient.return_value = instance
-
-        # Default: empty account balance
         instance.futures_account_balance.return_value = [
             {'asset': 'USDT', 'balance': '500.00000000'}
         ]
-
-        # Default: exchange info with BTCUSDT
-        instance.futures_exchange_info.return_value = {
-            'symbols': [{
-                'symbol': 'BTCUSDT',
-                'quantityPrecision': 3,
-                'pricePrecision': 2,
-                'filters': [
-                    {'filterType': 'LOT_SIZE', 'stepSize': '0.001'},
-                    {'filterType': 'PRICE_FILTER', 'tickSize': '0.01'},
-                ]
-            }]
-        }
-
+        instance.futures_exchange_info.return_value = BTCUSDT_EXCHANGE_INFO
         yield instance
 
 
@@ -186,112 +199,55 @@ class TestRoundQuantity:
 class TestPositionManagerIntegration:
     """Test that PositionManager correctly calls OrderExecutionService."""
 
-    def test_open_position_places_orders(self, service, mock_client, tmp_path):
-        """When order_execution_service is provided, open_position should place orders."""
-        import pandas as pd
-        from services.position_manager import PositionManager
-
-        class MockNotification:
-            def send_trade_notification(self, *args, **kwargs):
-                pass
-
-        mock_client.futures_create_order.return_value = {'orderId': 99999}
-
+    def _make_position_manager(self, tmp_path, order_execution_service=None):
+        """Helper to create a PositionManager with test defaults."""
         csv_path = str(tmp_path / "test_positions.csv")
-        pm = PositionManager(
+        return PositionManager(
             notification_service=MockNotification(),
-            strategy_config={
-                'TOTAL_CAPITAL': 10000.0,
-                'RISK_PER_TRADE_PERCENT': 0.01,
-                'TRANSACTION_FEE_PERCENT': 0.0006,
-                'use_volume_condition': False,
-            },
+            strategy_config=DEFAULT_STRATEGY_CONFIG.copy(),
             csv_path=csv_path,
-            order_execution_service=service,
+            order_execution_service=order_execution_service,
         )
 
-        signal = {
+    def _make_signal(self, entry_price=100.0, stop_loss=95.0, take_profit=200.0):
+        return {
             'timestamp': pd.Timestamp.now(),
-            'entry_price': 100.0,
-            'stop_loss': 95.0,
-            'take_profit': 200.0,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
         }
-        result = pm.open_position('BTCUSDT', signal)
+
+    def test_open_position_places_orders(self, service, mock_client, tmp_path):
+        """When order_execution_service is provided, open_position should place orders."""
+        mock_client.futures_create_order.return_value = {'orderId': 99999}
+        pm = self._make_position_manager(tmp_path, order_execution_service=service)
+
+        result = pm.open_position('BTCUSDT', self._make_signal())
+
         assert result is True
-        # Should have 3 calls: market buy, stop loss, take profit
         assert mock_client.futures_create_order.call_count == 3
 
     def test_open_position_works_without_service(self, tmp_path):
         """Without order_execution_service, open_position works as before (CSV only)."""
-        import pandas as pd
-        from services.position_manager import PositionManager
+        pm = self._make_position_manager(tmp_path)
 
-        class MockNotification:
-            def send_trade_notification(self, *args, **kwargs):
-                pass
+        result = pm.open_position('BTCUSDT', self._make_signal())
 
-        csv_path = str(tmp_path / "test_positions.csv")
-        pm = PositionManager(
-            notification_service=MockNotification(),
-            strategy_config={
-                'TOTAL_CAPITAL': 10000.0,
-                'RISK_PER_TRADE_PERCENT': 0.01,
-                'TRANSACTION_FEE_PERCENT': 0.0006,
-                'use_volume_condition': False,
-            },
-            csv_path=csv_path,
-        )
-
-        signal = {
-            'timestamp': pd.Timestamp.now(),
-            'entry_price': 100.0,
-            'stop_loss': 95.0,
-            'take_profit': 200.0,
-        }
-        result = pm.open_position('BTCUSDT', signal)
         assert result is True
         assert len(pm.positions_df) == 1
 
     def test_update_positions_closes_on_testnet(self, service, mock_client, tmp_path):
         """When TP/SL triggers, close_position should be called on testnet."""
-        import pandas as pd
-        from services.position_manager import PositionManager
-
-        class MockNotification:
-            def send_trade_notification(self, *args, **kwargs):
-                pass
-
         mock_client.futures_create_order.return_value = {'orderId': 99999}
         mock_client.futures_cancel_all_open_orders.return_value = {'code': 200}
+        pm = self._make_position_manager(tmp_path, order_execution_service=service)
 
-        csv_path = str(tmp_path / "test_positions.csv")
-        pm = PositionManager(
-            notification_service=MockNotification(),
-            strategy_config={
-                'TOTAL_CAPITAL': 10000.0,
-                'RISK_PER_TRADE_PERCENT': 0.01,
-                'TRANSACTION_FEE_PERCENT': 0.0006,
-                'use_volume_condition': False,
-            },
-            csv_path=csv_path,
-            order_execution_service=service,
-        )
-
-        signal = {
-            'timestamp': pd.Timestamp.now(),
-            'entry_price': 100.0,
-            'stop_loss': 95.0,
-            'take_profit': 110.0,
-        }
-        pm.open_position('BTCUSDT', signal)
-        # Reset call counts after open
+        pm.open_position('BTCUSDT', self._make_signal(take_profit=110.0))
         mock_client.futures_create_order.reset_mock()
         mock_client.futures_cancel_all_open_orders.reset_mock()
 
-        # Trigger take profit
         latest_kline = pd.Series({'High': 112, 'Low': 98, 'Close': 111, 'Datetime': pd.Timestamp.now()})
         pm.update_positions({'BTCUSDT': latest_kline})
 
-        # Should cancel orders + market sell
         mock_client.futures_cancel_all_open_orders.assert_called_once_with(symbol='BTCUSDT')
         mock_client.futures_create_order.assert_called_once()

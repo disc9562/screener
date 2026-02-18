@@ -1,42 +1,43 @@
-import pandas as pd
-import os
 import logging
+import os
+
+import pandas as pd
+
 from services.notification_service import NotificationService
 
+logger = logging.getLogger(__name__)
+
+POSITION_COLUMNS = [
+    'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit',
+    'units', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'pnl'
+]
+
+
 class PositionManager:
-    def __init__(self, notification_service: NotificationService, strategy_config: dict, csv_path='data/positions.csv', order_execution_service=None):
+    def __init__(self, notification_service: NotificationService, strategy_config: dict,
+                 csv_path='data/positions.csv', order_execution_service=None):
         self.csv_path = csv_path
         self.notification_service = notification_service
-        self.strategy_config = strategy_config # Store the strategy config
+        self.strategy_config = strategy_config
         self.order_execution_service = order_execution_service
         self.positions_df = self._load_positions()
-        
 
     def _load_positions(self) -> pd.DataFrame:
         """Loads positions from the CSV file or creates an empty DataFrame."""
         if os.path.exists(self.csv_path):
             try:
                 df = pd.read_csv(self.csv_path)
-                required_columns = [
-                    'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit', 
-                    'units', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'pnl'
-                ]
-                for col in required_columns:
+                for col in POSITION_COLUMNS:
                     if col not in df.columns:
                         df[col] = None
                 return df
             except pd.errors.EmptyDataError:
                 return self._create_empty_positions_df()
-        else:
-            return self._create_empty_positions_df()
+        return self._create_empty_positions_df()
 
     def _create_empty_positions_df(self) -> pd.DataFrame:
         """Creates an empty DataFrame with the required position columns."""
-        columns = [
-            'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit', 
-            'units', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'pnl'
-        ]
-        df = pd.DataFrame(columns=columns)
+        df = pd.DataFrame(columns=POSITION_COLUMNS)
         os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
         df.to_csv(self.csv_path, index=False)
         return df
@@ -45,31 +46,29 @@ class PositionManager:
         """Saves the current positions DataFrame to the CSV file."""
         self.positions_df.to_csv(self.csv_path, index=False)
 
+    def _opening_fee(self, entry_price: float, units: float) -> float:
+        """Calculate the transaction fee for opening a position."""
+        return entry_price * units * self.strategy_config.get('TRANSACTION_FEE_PERCENT')
+
+    def _is_volume_on(self) -> bool:
+        return self.strategy_config.get('use_volume_condition', False)
+
     def get_open_positions_symbols(self):
-        """
-        Returns a list of symbols for all positions with 'OPEN' status.
-        """
-        logging.info(f"DEBUG_PM ({self.csv_path}): Getting open positions. Current DF:\n{self.positions_df}")
+        """Returns a list of symbols for all positions with 'OPEN' status."""
         if self.positions_df.empty or 'status' not in self.positions_df.columns:
-            logging.info(f"DEBUG_PM ({self.csv_path}): DataFrame is empty, returning [].")
             return []
-        
         open_positions = self.positions_df[self.positions_df['status'] == 'OPEN']
-        symbols = open_positions['symbol'].unique().tolist()
-        logging.info(f"DEBUG_PM ({self.csv_path}): Found open positions for symbols: {symbols}")
-        return symbols
+        return open_positions['symbol'].unique().tolist()
 
     def open_position(self, symbol: str, signal: dict):
-        """
-        Opens a new position based on a signal, if no open position exists for the symbol.
-        """
+        """Opens a new position based on a signal, if no open position exists for the symbol."""
         open_positions = self.positions_df[
             (self.positions_df['symbol'] == symbol) &
             (self.positions_df['status'] == 'OPEN')
         ]
 
         if not open_positions.empty:
-            logging.info(f"Position for {symbol} is already open. Ignoring new BUY signal.")
+            logger.info(f"Position for {symbol} is already open. Ignoring new BUY signal.")
             return False
 
         entry_price = signal.get('entry_price')
@@ -77,25 +76,21 @@ class PositionManager:
         take_profit = signal.get('take_profit')
         timestamp = signal.get('timestamp')
 
-        # Calculate units based on risk management (AC2)
-        total_capital = self.strategy_config.get('TOTAL_CAPITAL')
-        risk_per_trade_percent = self.strategy_config.get('RISK_PER_TRADE_PERCENT')
-
         if entry_price is None or stop_loss is None:
-            logging.error(f"Cannot open position for {symbol}: entry_price or stop_loss is missing from signal.")
+            logger.error(f"Cannot open position for {symbol}: entry_price or stop_loss is missing from signal.")
             return False
 
         price_diff = abs(entry_price - stop_loss)
         if price_diff == 0:
-            logging.error(f"Cannot open position for {symbol}: entry_price and stop_loss are the same. Units cannot be calculated.")
+            logger.error(f"Cannot open position for {symbol}: entry_price and stop_loss are the same.")
             return False
 
-        # Calculate units
-        risk_amount = total_capital * risk_per_trade_percent
-        units = risk_amount / price_diff
+        total_capital = self.strategy_config.get('TOTAL_CAPITAL')
+        risk_per_trade_percent = self.strategy_config.get('RISK_PER_TRADE_PERCENT')
+        units = (total_capital * risk_per_trade_percent) / price_diff
 
         if units <= 0:
-            logging.error(f"Calculated units for {symbol} is {units}. Must be positive. Aborting position opening.")
+            logger.error(f"Calculated units for {symbol} is {units}. Must be positive.")
             return False
 
         new_position = {
@@ -104,53 +99,62 @@ class PositionManager:
             'entry_price': entry_price,
             'stop_loss': stop_loss,
             'take_profit': take_profit,
-            'units': units, # Use calculated units
+            'units': units,
             'entry_timestamp': timestamp,
             'exit_timestamp': pd.NaT,
             'exit_reason': None,
-            'pnl': -(entry_price * units * self.strategy_config.get('TRANSACTION_FEE_PERCENT')) # Account for opening fee
+            'pnl': -self._opening_fee(entry_price, units),
         }
-        
+
         new_pos_df = pd.DataFrame([new_position])
         self.positions_df = pd.concat([self.positions_df, new_pos_df], ignore_index=True)
-        logging.info(f"DEBUG_PM ({self.csv_path}): DataFrame after adding new position for {symbol}:\n{self.positions_df}")
-        
         self._save_positions()
-        logging.info(f"Opened new position for {symbol} at {new_position['entry_price']}.")
+        logger.info(f"Opened new position for {symbol} at {entry_price}.")
 
-        # Execute orders on testnet if enabled
-        testnet_orders = None
-        if self.order_execution_service:
-            try:
-                entry_order = self.order_execution_service.place_market_order(symbol, 'BUY', units)
-                if entry_order:
-                    sl_order = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop_loss)
-                    tp_order = self.order_execution_service.place_take_profit_order(symbol, 'SELL', units, take_profit)
-                    testnet_orders = {
-                        'entry': entry_order,
-                        'stop_loss': sl_order,
-                        'take_profit': tp_order,
-                    }
-                else:
-                    logging.warning(f"Testnet market order failed for {symbol}, skipping SL/TP orders")
-            except Exception as e:
-                logging.error(f"Testnet order execution error for {symbol}: {e}")
+        testnet_orders = self._execute_open_orders(symbol, units, stop_loss, take_profit)
 
         self.notification_service.send_trade_notification(
             symbol=symbol,
             action="BUY",
-            price=new_position['entry_price'],
-            units=new_position['units'],
-            stop_loss_price=new_position['stop_loss'],
-            is_volume_on=self.strategy_config.get('use_volume_condition', False),
+            price=entry_price,
+            units=units,
+            stop_loss_price=stop_loss,
+            is_volume_on=self._is_volume_on(),
             testnet_orders=testnet_orders,
         )
         return True
 
+    def _execute_open_orders(self, symbol: str, units: float,
+                             stop_loss: float, take_profit: float) -> dict | None:
+        """Place entry, SL, and TP orders on testnet. Returns order details or None."""
+        if not self.order_execution_service:
+            return None
+        try:
+            entry_order = self.order_execution_service.place_market_order(symbol, 'BUY', units)
+            if not entry_order:
+                logger.warning(f"Testnet market order failed for {symbol}, skipping SL/TP orders")
+                return None
+            sl_order = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop_loss)
+            tp_order = self.order_execution_service.place_take_profit_order(symbol, 'SELL', units, take_profit)
+            return {'entry': entry_order, 'stop_loss': sl_order, 'take_profit': tp_order}
+        except Exception as e:
+            logger.error(f"Testnet order execution error for {symbol}: {e}")
+            return None
+
+    def _execute_close_orders(self, symbol: str, units: float) -> dict | None:
+        """Close position on testnet. Returns order details or None."""
+        if not self.order_execution_service:
+            return None
+        try:
+            close_order = self.order_execution_service.close_position(symbol, units)
+            if close_order:
+                return {'close': close_order}
+        except Exception as e:
+            logger.error(f"Testnet close position error for {symbol}: {e}")
+        return None
+
     def update_positions(self, latest_klines: dict):
-        """
-        Updates all open positions based on the latest kline data.
-        """
+        """Updates all open positions based on the latest kline data."""
         if self.positions_df.empty:
             return
 
@@ -158,18 +162,18 @@ class PositionManager:
         if open_positions_indices.empty:
             return
 
-        positions_updated = False
+        positions_closed = False
         for index in open_positions_indices:
             position = self.positions_df.loc[index]
             symbol = position['symbol']
-            
+
             if symbol not in latest_klines:
                 continue
 
             kline = latest_klines[symbol]
             exit_price = None
             exit_reason = None
-            
+
             if kline['High'] >= position['take_profit']:
                 exit_price = position['take_profit']
                 exit_reason = 'TAKE_PROFIT'
@@ -178,26 +182,18 @@ class PositionManager:
                 exit_reason = 'STOP_LOSS'
 
             if exit_price is not None:
+                fee_rate = self.strategy_config.get('TRANSACTION_FEE_PERCENT')
+                closing_fee = exit_price * position['units'] * fee_rate
+                pnl = (exit_price - position['entry_price']) * position['units'] - closing_fee
+
                 self.positions_df.loc[index, 'status'] = 'CLOSED'
                 self.positions_df.loc[index, 'exit_reason'] = exit_reason
                 self.positions_df.loc[index, 'exit_timestamp'] = kline['Datetime']
-                pnl = (exit_price - position['entry_price']) * position['units']
-                # Account for closing fee
-                closing_fee = exit_price * position['units'] * self.strategy_config.get('TRANSACTION_FEE_PERCENT')
-                pnl -= closing_fee
                 self.positions_df.loc[index, 'pnl'] = pnl
-                logging.info(f"Closed position for {symbol} by {exit_reason}. PnL: {pnl:.2f}")
-                positions_updated = True
+                logger.info(f"Closed position for {symbol} by {exit_reason}. PnL: {pnl:.2f}")
+                positions_closed = True
 
-                # Close position on testnet if enabled
-                testnet_orders = None
-                if self.order_execution_service:
-                    try:
-                        close_order = self.order_execution_service.close_position(symbol, position['units'])
-                        if close_order:
-                            testnet_orders = {'close': close_order}
-                    except Exception as e:
-                        logging.error(f"Testnet close position error for {symbol}: {e}")
+                testnet_orders = self._execute_close_orders(symbol, position['units'])
 
                 self.notification_service.send_trade_notification(
                     symbol=symbol,
@@ -206,15 +202,13 @@ class PositionManager:
                     units=position['units'],
                     reason=exit_reason,
                     pnl=pnl,
-                    is_volume_on=self.strategy_config.get('use_volume_condition', False),
+                    is_volume_on=self._is_volume_on(),
                     testnet_orders=testnet_orders,
                 )
             else:
-                # Calculate floating PnL from price change
-                floating_pnl_from_price_change = (kline['Close'] - position['entry_price']) * position['units']
-                # The initial PnL already includes the opening fee (which is negative)
-                # So, the current PnL is the floating PnL from price change plus the initial PnL (opening fee)
-                self.positions_df.loc[index, 'pnl'] = floating_pnl_from_price_change + (-(position['entry_price'] * position['units'] * self.strategy_config.get('TRANSACTION_FEE_PERCENT')))
+                floating_pnl = (kline['Close'] - position['entry_price']) * position['units']
+                opening_fee = self._opening_fee(position['entry_price'], position['units'])
+                self.positions_df.loc[index, 'pnl'] = floating_pnl - opening_fee
 
-        if positions_updated:
+        if positions_closed:
             self._save_positions()

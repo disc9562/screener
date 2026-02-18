@@ -57,7 +57,11 @@ OUTPUT_DIR = "output"
 TEST_COIN_SUBSET = os.getenv("TEST_COIN_SUBSET", "BTCUSDT,ETHUSDT").split(',')
 
 def get_strategy_config():
-    """Gathers all strategy-related configurations into a dictionary."""
+    """Gathers all strategy-related configurations into a dictionary.
+
+    Note: Testnet API keys and USE_TESTNET are intentionally excluded here.
+    They are imported directly as module-level constants where needed (e.g. main.py).
+    """
     return {
         "DEFAULT_TIMEFRAME": DEFAULT_TIMEFRAME,
         "STOCK_SMA_PERIODS": STOCK_SMA_PERIODS,
@@ -81,9 +85,6 @@ def get_strategy_config():
         "DISCORD_WEBHOOK_URL_GENERAL_TARGETS": DISCORD_WEBHOOK_URL_GENERAL_TARGETS,
         "TARGET_FETCH_TIMES": TARGET_FETCH_TIMES,
         "TEST_COIN_SUBSET": TEST_COIN_SUBSET,
-        "USE_TESTNET": USE_TESTNET,
-        "BINANCE_TESTNET_API_KEY": BINANCE_TESTNET_API_KEY,
-        "BINANCE_TESTNET_API_SECRET": BINANCE_TESTNET_API_SECRET,
     }
 
 print("Configuration loaded.")
