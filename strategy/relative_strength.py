@@ -9,8 +9,11 @@ class RelativeStrengthStrategy(Strategy):
         super().__init__(config)
 
     def _fetch_data(self, symbol: str, timeframe: str):
-        # crypto_relative_strength.py uses limit=1500 for klines
-        return self._fetch_crypto_data(symbol, timeframe, limit=1500)
+        # Fetch only what the score needs: RS window + the "+60" check in _analyze + SMA60 warmup rows that
+        # transform_crypto_data drops. 15m/3 days = 408 bars -> request weight 2 (1500 bars weighed 10).
+        bars = self._calc_total_bars(RS_TIME_INTERVAL, RS_CALC_DAYS)
+        limit = min(1500, bars + 2 * max(CRYPTO_SMA_PERIODS)) if bars else 1500
+        return self._fetch_crypto_data(symbol, timeframe, limit=limit)
 
     def _transform_data(self, raw_data, symbol: str, timeframe: str):
         return self._transform_crypto_data_default(raw_data)
