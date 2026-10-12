@@ -1,63 +1,159 @@
-# Screener
+# Screener (Refactored)
+
+**NOTE: This project has been refactored to a modular structure. The old standalone scripts are deprecated and have been removed.**
 
 下載美股和加密貨幣的歷史數據並透過自己的策略去找到強勢標的
 
 The purpose of this project is to download historical data for US stocks and cryptocurrencies, and use different strategies to identify strong performing assets.
 
-## Installation
+## New Project Structure
 
-```bash
-pip3 install -r requirements.txt
+The project has been refactored into a more organized, modular structure:
+
+```
+screener/
+├── main.py             # New application entry point
+├── config.py           # All application settings
+├── .env.example        # Template for environment variables (API keys, etc.)
+├── data/               # Modules for fetching and transforming data
+│   ├── fetcher.py
+│   └── transformer.py
+├── services/           # For business logic like trading and notifications
+├── strategy/           # Where different trading/screening strategies reside
+└── tests/              # Unit and integration tests
 ```
 
-API keys are needed for [Polygon](https://polygon.io) and [Stocksymbol](https://stock-symbol.herokuapp.com) (Not a requirement for Crypto usage)
+## Getting Started
 
-## Strategy Usage
+### Installation
 
-1. Crypto relative strength
-
-Identify strong performing assets by comparing them with SMA-30, SMA-45 and SMA-60 (Default time frame = 15m, total days = 7)
+To set up the project, follow these steps:
 
 ```bash
-python3 crypto_relative_strength.py  
-python3 crypto_relative_strength.py -t "1h" -d 60
+# 1. Clone the repository (if you haven't already)
+# git clone <repository_url>
+# cd screener
+
+# 2. Install dependencies using Makefile
+make install
 ```
-* `-t` Time frame (3m, 5m, 15m, 30m, 1h, 2h, 4h)
-* `-d` Calculation duration in days (max: 1440 bars), e.g. 1440 / (24 bars per day in 1h) = 60
-* Change CURRENT_TIMEZONE in the file if timezone is essential to you.[[Refer](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)]
 
-2. US stock trend template
+### Configuration
 
-Utilize Mark Minervini's trend template to filter out strong performing stocks.
+This project uses environment variables for sensitive information like API keys and webhook URLs.
+
+1.  **Create your environment file**: Copy the example environment file.
+    ```bash
+    cp .env.example .env
+    ```
+2.  **Edit `.env`**: Open the newly created `.env` file and replace the placeholder with your actual Discord Webhook URL.
+    ```
+    DISCORD_WEBHOOK_URL=your_discord_webhook_url_here
+    ```
+    *(Other API keys like BINANCE_API_KEY, BINANCE_API_SECRET, POLYGON_API_KEY should also be set here if needed by your strategies.)*
+
+### WebSocket API Key Configuration
+
+This project uses Binance WebSocket API for real-time data. To enable WebSocket functionality, you need to configure your Binance API Key and API Secret.
+
+1.  **Obtain API Keys**: Log in to your Binance account and generate your API Key and API Secret. Ensure these keys have the necessary permissions for WebSocket access (read-only access is usually sufficient for market data).
+2.  **Configure in `.env`**: Add the following variables to your `.env` file:
+    ```
+    BINANCE_API_KEY=your_binance_api_key_here
+    BINANCE_API_SECRET=your_binance_api_secret_here
+    ```
+
+### Strong Target Notification Configuration
+
+The application can send notifications for changes in the strong target list. This uses Discord webhooks.
+
+1.  **Obtain Discord Webhook URL**: Create a webhook in your Discord server.
+2.  **Configure in `.env`**: Add the following variable to your `.env` file:
+    ```
+    DISCORD_WEBHOOK_URL_GENERAL_TARGETS=your_discord_general_targets_webhook_url_here
+    ```
+
+### Usage
+
+
+This project uses a `Makefile` to simplify common operations.
 
 ```bash
-python3 stock_trend_template.py
+# Run the application
+make run
+
+# Run all tests
+make test
+
+# Clean up generated files and caches
+make clean
+
+### Strong Target Fetching Schedule
+
+The application is configured to automatically fetch strong targets twice a day at specific times (defaulting to 08:00 and 20:00 UTC).
+
+You can configure these times in your `.env` file:
+```
+TARGET_FETCH_TIMES="08:00,20:00" # Comma-separated times in HH:MM format
 ```
 
-Both scripts will generate a TXT file that can be imported into [TradingView](https://www.tradingview.com/)'s watchlist.
+### Manual Strong Target Fetch
 
-## Crypto Relative Strength Formula 
-$$ bars = 4 \times 24 \times days  \text{  (15m time frame)} $$
+For development and testing purposes, you can trigger an immediate strong target fetch, bypassing the schedule.
 
-$$ W = \frac{(bars-i)\times days}{bars} + 1 $$
+```bash
+python main.py --fetch-now
+```
+When `--fetch-now` is used, the application will perform one immediate fetch and then exit (unless a `--timeout` is also specified).
+```
 
-$$ \begin{align*}
-N_i & = \left [ (P_i - MA30_i) + (P_i - MA45_i) + (P_i - MA60_i) \right ]\times W\\  
-                       & +(MA30_i - MA60_i) +(MA30_i - MA45_i) + (MA45_i - MA60_i)\\  
-\end{align*} $$
+## Binance Futures Testnet
 
-$$ Score = \sum_{i=1}^{bars} \frac{N_i} {MA60_i} \times (bars - i)  \\ \text{where i=1 means the closest bar} $$
+The application supports live order execution on Binance Futures Testnet for end-to-end trading flow validation.
 
+### Setup
+
+1. **Get Testnet API Keys**: Register at https://testnet.binancefuture.com and create API keys.
+2. **Configure `.env`**:
+   ```
+   USE_TESTNET=true
+   BINANCE_TESTNET_API_KEY=your_testnet_api_key
+   BINANCE_TESTNET_API_SECRET=your_testnet_api_secret
+   ```
+3. **Run**: `python main.py --fetch-now`
+
+### How it works
+
+When `USE_TESTNET=true`, signals generated by the Alligator strategy will automatically:
+- Place a **MARKET BUY** order on entry
+- Set a **STOP_MARKET** (stop loss) and **TAKE_PROFIT_MARKET** order
+- On TP/SL trigger: cancel remaining orders and place a **MARKET SELL** to close
+
+All existing behavior (CSV tracking, Discord notifications) is preserved. If testnet order placement fails, it is logged but does not affect the CSV-based position tracking.
+
+### Notes
+
+- Testnet has limited symbol availability (not all USDT pairs exist)
+- Default testnet balance is typically 500 USDT
+- Signal screening still uses production market data for accuracy
+- Verify orders at https://testnet.binancefuture.com after running
+
+## Rollback Strategy
+
+If a new deployment causes critical issues, a rollback can be performed using git.
+
+1.  **Identify the problematic commit hash** using `git log`.
+2.  **Revert the commit** using the command: `git revert <commit_hash>`
+3.  This will create a new commit that undoes the changes from the problematic one.
 
 ## Download historical data only
-To import crypto or stock downloader for your own usage, simply include the following line in your Python code:
 
-```python3
-from src.downloader import StockDownloader
-from src.downloader import CryptoDownloader
+To import the refactored data modules for your own usage, simply include the following lines in your Python code:
+
+```python
+from data.fetcher import StockFetcher, CryptoFetcher
+from data.transformer import transform_stock_data, transform_crypto_data
 ```
-
-When devising your own strategy, feel free to refer to the existing strategies for guidance and inspiration. The stock data is downloaded from Polygon.io and the cryptocurrency data is obtained from Binance.
 
 ## License
 
