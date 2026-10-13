@@ -1,0 +1,102 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from strategy import shotgun_v3 as V
+
+
+def _ref_rma(x, n):
+    out = np.full(len(x), np.nan)
+    out[n - 1] = np.mean(x[:n])
+    for i in range(n, len(x)):
+        out[i] = (out[i - 1] * (n - 1) + x[i]) / n
+    return out
+
+
+def _walk(n=1200, seed=0, drift=0.0005):
+    rng = np.random.default_rng(seed)
+    return 100 * np.exp(np.cumsum(rng.normal(drift, 0.01, n)))
+
+
+def test_rma_seeded_matches_pine():
+    c = _walk()
+    for n in V.SMMA_LENS:
+        got = V.rma_seeded(c, n)
+        assert np.isnan(got[n - 2]) and np.array_equal(got[n - 1:], _ref_rma(c, n)[n - 1:])
+
+
+def test_efficiency_ratio_matches_definition():
+    c = _walk(300)
+    er = V.efficiency_ratio(c)
+    for i in (50, 120, 299):
+        path = np.abs(np.diff(c[i - 50:i + 1])).sum()
+        assert np.isclose(er[i], (c[i] - c[i - 50]) / path)
+    assert er[49] == 0.0
+
+
+def test_entry_and_exit_rules():
+    assert V.entry_signal(11, 10.5, 10.4, 10.3, 10.0, 0.2)
+    assert not V.entry_signal(11, 10.5, 10.4, 10.3, 10.0, 0.19)       # ER 不足
+    assert not V.entry_signal(10.4, 10.5, 10.4, 10.3, 10.0, 0.5)      # 收盤不在 SMMA10 之上
+    assert not V.entry_signal(11, 10.5, 10.4, 10.3, np.nan, 0.5)      # SMMA233 尚未暖機
+    assert V.exit_signal(10.0, 10.0, 9.9, 10.0)                        # 由 ≥ 轉 <
+    assert not V.exit_signal(9.8, 10.0, 9.7, 10.0)                     # 原本就 <，不是事件
+
+
+def _ref_rs(close, end, bars=168, days=28, skip=6):
+    """研究 rs_formula_variants._scores("skip") 的逐字版本。"""
+    s = pd.Series(close)
+    m30, m45, m60 = (s.rolling(n).mean().to_numpy() for n in (30, 45, 60))
+    e = end - skip
+    if e + 1 < bars + 60:
+        return None
+    sl = slice(e - bars + 1, e + 1)
+    c, a30, a45, a60 = close[sl], m30[sl], m45[sl], m60[sl]
+    j = np.arange(bars, dtype=float)
+    w = (((c - a30) + (c - a45) + (c - a60)) * ((j * days / bars) + 1) + (a30 - a45) + (a30 - a60) + (a45 - a60)) / a60
+    return float(np.sum(w * j))
+
+
+def test_rs_score_matches_research_formula():
+    c = _walk(500, seed=3)
+    for end in (240, 300, 499):
+        assert np.isclose(V.rs_score(c, end), _ref_rs(c, end), rtol=1e-12)
+    assert V.rs_score(c, 200) is None                                  # 不足 168+60+6 根
+
+
+def test_rank_top_breaks_ties_by_symbol():
+    assert V.rank_top({"B": 1.0, "A": 1.0, "C": 3.0}, top_n=2) == ["C", "A"]
+
+
+def test_btc_bull_uses_ema200_of_daily_closes():
+    up = np.linspace(100, 200, 1000)
+    assert V.btc_bull(up)
+    assert not V.btc_bull(np.r_[up, np.full(5, 120.0)])
+
+
+def test_streaming_state_equals_batch():
+    c = _walk(1600)
+    t = np.arange(len(c), dtype=np.int64) * V.HOUR_MS
+    st = V.SymbolState.from_history(t[:1500], c[:1500])
+    snaps = [st.update(int(t[i]), float(c[i])) for i in range(1500, 1600)]
+    s10, s20, s50, s233, er = V.indicators(c)
+    last = snaps[-1]
+    assert (last.s10, last.s20, last.s50, last.s233) == (s10[-1], s20[-1], s50[-1], s233[-1])
+    assert np.isclose(last.er, er[-1]) and (last.prev_s10, last.prev_s20) == (s10[-2], s20[-2])
+
+
+def test_duplicate_kline_is_ignored():
+    c = _walk(400)
+    t = np.arange(len(c), dtype=np.int64) * V.HOUR_MS
+    st = V.SymbolState.from_history(t, c)
+    before = (st.s[10], st.last_open_ms)
+    assert st.update(int(t[-1]), float(c[-1]) * 2) is None
+    assert (st.s[10], st.last_open_ms) == before
+
+
+def test_gap_raises():
+    c = _walk(400)
+    t = np.arange(len(c), dtype=np.int64) * V.HOUR_MS
+    st = V.SymbolState.from_history(t, c)
+    with pytest.raises(V.GapError):
+        st.update(int(t[-1]) + 2 * V.HOUR_MS, 100.0)
