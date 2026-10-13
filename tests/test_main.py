@@ -72,3 +72,15 @@ def test_bootstrap_survives_rebalance_failure():
     syms, ok = main.bootstrap(live, pm, pd.Timestamp("2026-01-01 05:00"))
     assert ok is False and syms == {"ZZZUSDT"}
     live.warmup.assert_called_once_with("ZZZUSDT")
+
+
+def test_order_execution_disabled_in_hedge_mode(monkeypatch):
+    svc = MagicMock()
+    svc.is_one_way_mode.return_value = False
+    monkeypatch.setattr(main, "USE_TESTNET", True)
+    monkeypatch.setattr(main, "BINANCE_TESTNET_API_KEY", "k")
+    monkeypatch.setattr(main, "BINANCE_TESTNET_API_SECRET", "s")
+    monkeypatch.setattr(main, "OrderExecutionService", MagicMock(return_value=svc))
+    assert main._init_order_execution_service() is None
+    svc.is_one_way_mode.return_value = True
+    assert main._init_order_execution_service() is svc

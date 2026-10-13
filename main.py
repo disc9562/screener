@@ -34,7 +34,12 @@ def _init_order_execution_service():
         logging.warning("USE_TESTNET is enabled but BINANCE_TESTNET_API_KEY/SECRET not set. Running without order execution.")
         return None
     try:
-        return OrderExecutionService(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET)
+        service = OrderExecutionService(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET)
+        if not service.is_one_way_mode():
+            logging.error("Account is in hedge (dual-side) position mode: reduceOnly orders would fail. "
+                          "Switch to one-way mode. Order execution DISABLED.")
+            return None
+        return service
     except Exception as e:
         logging.error(f"Failed to initialize OrderExecutionService: {e}")
         logging.warning("Continuing without testnet order execution.")

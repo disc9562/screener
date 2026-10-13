@@ -15,6 +15,7 @@ class OrderExecutionService:
     def __init__(self, api_key: str, api_secret: str):
         self.client = Client(api_key, api_secret, testnet=True)
         self._symbol_info_cache = {}
+        self._cross_margin_done = set()
         logger.info("Testnet order execution ENABLED")
         self._log_account_balance()
 
@@ -145,6 +146,28 @@ class OrderExecutionService:
                 return order
         logger.error(f"Close failed for {symbol} after {attempts} attempts; stop order left in place")
         return None
+
+    def is_one_way_mode(self) -> bool:
+        """reduceOnly orders only work in one-way position mode (dualSidePosition = false)."""
+        try:
+            return not bool(self.client.futures_get_position_mode().get('dualSidePosition'))
+        except Exception as e:
+            logger.error(f"Failed to read position mode: {e}")
+            return False
+
+    def ensure_cross_margin(self, symbol: str) -> bool:
+        """Set CROSSED margin once per symbol (-4046 = already crossed). Isolated margin with the
+        default leverage would liquidate long before the −20% disaster stop."""
+        if symbol in self._cross_margin_done:
+            return True
+        try:
+            self.client.futures_change_margin_type(symbol=symbol, marginType='CROSSED')
+        except Exception as e:
+            if getattr(e, 'code', None) != -4046:
+                logger.error(f"Failed to set CROSSED margin for {symbol}: {e}")
+                return False
+        self._cross_margin_done.add(symbol)
+        return True
 
     def get_account_balance(self) -> list | None:
         """Get futures account balance."""

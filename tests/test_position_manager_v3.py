@@ -78,6 +78,7 @@ def _svc():
     svc = OrderExecutionService.__new__(OrderExecutionService)
     svc.client = MagicMock()
     svc._symbol_info_cache = {"AAAUSDT": {"quantityPrecision": 3, "pricePrecision": 4, "stepSize": 0.001, "tickSize": 0.0001}}
+    svc._cross_margin_done = set()                       # 同 __init__
     return svc
 
 
@@ -129,3 +130,32 @@ def test_exchange_close_failure_alerts(tmp_path):
     pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
     pm.close_by_signal("AAAUSDT", 2.2, pd.Timestamp("2026-01-02"))
     assert any("平倉失敗" in str(c) for c in notif.send_heartbeat_notification.call_args_list)
+
+
+def test_one_way_mode_check():
+    """I5：雙向持倉（hedge）模式下 reduceOnly 單全部會失敗，必須偵測。"""
+    svc = _svc()
+    svc.client.futures_get_position_mode.return_value = {"dualSidePosition": True}
+    assert svc.is_one_way_mode() is False
+    svc.client.futures_get_position_mode.return_value = {"dualSidePosition": False}
+    assert svc.is_one_way_mode() is True
+
+
+def test_ensure_cross_margin_ignores_already_crossed_and_caches():
+    from binance.exceptions import BinanceAPIException
+    svc = _svc()
+    svc.client.futures_change_margin_type.side_effect = BinanceAPIException(
+        MagicMock(), 400, '{"code":-4046,"msg":"No need to change margin type."}')
+    assert svc.ensure_cross_margin("AAAUSDT") is True
+    assert svc.ensure_cross_margin("AAAUSDT") is True
+    svc.client.futures_change_margin_type.assert_called_once_with(symbol="AAAUSDT", marginType="CROSSED")
+
+
+def test_open_notional_sets_cross_margin_before_entry(tmp_path):
+    oes = MagicMock()
+    order = []
+    oes.ensure_cross_margin.side_effect = lambda s: order.append("margin") or True
+    oes.place_market_order.side_effect = lambda *a, **k: order.append("buy") or {"orderId": 1}
+    pm, _ = _pm(tmp_path, oes)
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
+    assert order == ["margin", "buy"]

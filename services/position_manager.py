@@ -236,6 +236,7 @@ class PositionManager:
         orders = None
         if self.order_execution_service:
             try:
+                self.order_execution_service.ensure_cross_margin(symbol)
                 entry = self.order_execution_service.place_market_order(symbol, 'BUY', units)
                 sl = None
                 for _ in range(3 if entry else 0):
