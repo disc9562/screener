@@ -54,3 +54,36 @@ def test_close_position_is_reduce_only():
     svc.close_position("AAAUSDT", 200.0)
     kwargs = svc.client.futures_create_order.call_args.kwargs
     assert kwargs["reduceOnly"] == "true" and kwargs["side"] == "SELL"
+
+
+def test_close_after_csv_reload_reaches_exchange(tmp_path):
+    """C1：重啟後從 CSV 讀回，平倉不得丟 dtype 例外，且要真的送出交易所平倉。"""
+    oes = MagicMock()
+    pm, _ = _pm(tmp_path, oes)
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
+    pm2 = PositionManager(MagicMock(), {"TOTAL_CAPITAL": 10000.0, "TRANSACTION_FEE_PERCENT": 0.0005},
+                          str(tmp_path / "p.csv"), order_execution_service=oes)
+    assert pm2.close_by_signal("AAAUSDT", 2.2, pd.Timestamp("2026-01-02"))
+    oes.close_position.assert_called_once()
+    pm3 = PositionManager(MagicMock(), {"TOTAL_CAPITAL": 10000.0, "TRANSACTION_FEE_PERCENT": 0.0005}, str(tmp_path / "p.csv"))
+    assert pm3.get_open_positions_symbols() == []
+    assert pm3.open_notional("BBBUSDT", 1.0, pd.Timestamp("2026-01-03"), 0.04, 0.20)
+    pm4 = PositionManager(MagicMock(), {"TOTAL_CAPITAL": 10000.0, "TRANSACTION_FEE_PERCENT": 0.0005}, str(tmp_path / "p.csv"))
+    k = pd.Series({"Datetime": pd.Timestamp("2026-01-04"), "High": 1.0, "Low": 0.7, "Close": 0.75})
+    pm4.update_positions({"BBBUSDT": k})                      # 紙上災難止損路徑（已有 CLOSED 列時）
+    assert PositionManager(MagicMock(), {}, str(tmp_path / "p.csv")).get_open_positions_symbols() == []
+
+
+def _svc():
+    svc = OrderExecutionService.__new__(OrderExecutionService)
+    svc.client = MagicMock()
+    svc._symbol_info_cache = {"AAAUSDT": {"quantityPrecision": 3, "pricePrecision": 4, "stepSize": 0.001, "tickSize": 0.0001}}
+    return svc
+
+
+def test_cancel_open_orders_also_cancels_conditional_algo_orders():
+    """C3：STOP_MARKET 會被轉送到 algo 端點，撤單必須也帶 conditional=True。"""
+    svc = _svc()
+    svc.cancel_open_orders("AAAUSDT")
+    calls = [c.kwargs for c in svc.client.futures_cancel_all_open_orders.call_args_list]
+    assert {"symbol": "AAAUSDT"} in calls and {"symbol": "AAAUSDT", "conditional": True} in calls

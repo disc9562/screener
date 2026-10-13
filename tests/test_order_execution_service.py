@@ -175,7 +175,7 @@ class TestClosePosition:
         result = service.close_position('BTCUSDT', 0.5)
 
         assert result is not None
-        mock_client.futures_cancel_all_open_orders.assert_called_once_with(symbol='BTCUSDT')
+        assert [c.kwargs for c in mock_client.futures_cancel_all_open_orders.call_args_list] == [{'symbol': 'BTCUSDT'}, {'symbol': 'BTCUSDT', 'conditional': True}]
         mock_client.futures_create_order.assert_called_once_with(
             symbol='BTCUSDT',
             side='SELL',
@@ -250,5 +250,5 @@ class TestPositionManagerIntegration:
         latest_kline = pd.Series({'High': 112, 'Low': 98, 'Close': 111, 'Datetime': pd.Timestamp.now()})
         pm.update_positions({'BTCUSDT': latest_kline})
 
-        mock_client.futures_cancel_all_open_orders.assert_called_once_with(symbol='BTCUSDT')
+        assert [c.kwargs for c in mock_client.futures_cancel_all_open_orders.call_args_list] == [{'symbol': 'BTCUSDT'}, {'symbol': 'BTCUSDT', 'conditional': True}]
         mock_client.futures_create_order.assert_called_once()

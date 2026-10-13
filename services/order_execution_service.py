@@ -123,14 +123,17 @@ class OrderExecutionService:
         return self._place_conditional_order(symbol, side, quantity, stop_price, 'TAKE_PROFIT_MARKET')
 
     def cancel_open_orders(self, symbol: str) -> dict | None:
-        """Cancel all open orders for a symbol."""
-        try:
-            result = self.client.futures_cancel_all_open_orders(symbol=symbol)
-            logger.info(f"Cancelled all open orders for {symbol}: {result}")
-            return result
-        except Exception as e:
-            logger.error(f"Failed to cancel open orders for {symbol}: {e}")
-            return None
+        """Cancel all open orders for a symbol, including conditional (algo) orders:
+        python-binance routes STOP_MARKET / TAKE_PROFIT_MARKET to the algo endpoint,
+        which allOpenOrders does not touch."""
+        result = None
+        for extra in ({}, {"conditional": True}):
+            try:
+                result = self.client.futures_cancel_all_open_orders(symbol=symbol, **extra)
+                logger.info(f"Cancelled open {'conditional ' if extra else ''}orders for {symbol}: {result}")
+            except Exception as e:
+                logger.error(f"Failed to cancel open {'conditional ' if extra else ''}orders for {symbol}: {e}")
+        return result
 
     def close_position(self, symbol: str, quantity: float) -> dict | None:
         """Close a position: cancel pending orders then reduce-only market sell

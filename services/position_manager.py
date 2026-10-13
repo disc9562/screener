@@ -26,7 +26,10 @@ class PositionManager:
         """Loads positions from the CSV file or creates an empty DataFrame."""
         if os.path.exists(self.csv_path):
             try:
-                df = pd.read_csv(self.csv_path)
+                # 文字／時間欄固定讀成 object：pandas 3 會把全空欄推成 float64、把有值的推成 str，
+                # 之後寫入 exit_reason / exit_timestamp 會丟 TypeError（重啟後無法平倉）
+                df = pd.read_csv(self.csv_path, dtype={c: object for c in (
+                    'symbol', 'status', 'entry_timestamp', 'exit_timestamp', 'exit_reason')})
                 for col in POSITION_COLUMNS:
                     if col not in df.columns:
                         df[col] = None
