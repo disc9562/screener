@@ -91,3 +91,16 @@ def test_exit_fires_even_if_cross_bar_was_missed():
     st = live.states["AAAUSDT"]
     assert st.s[10] < st.s[20]                                  # 交叉已在停機期間發生
     assert live.on_closed_kline("AAAUSDT", T0, float(down[-1] * 0.99), has_position=True) == "SELL"
+
+
+def test_failed_warmup_is_retried_on_next_kline():
+    """I2：暖機失敗不得讓該幣整個 session 失效；下一根收完時要補暖機並照常判斷。"""
+    f = FakeFetcher()
+    up = 100 * np.exp(np.cumsum(np.full(1500, 0.001)))
+    f.k1h["AAAUSDT"] = None                                     # REST 暫時失敗
+    live = _live(f, now_ms=T0 + H)
+    assert not live.warmup("AAAUSDT")
+    f.k1h["AAAUSDT"] = _rows(up, T0 - 1499 * H, H)              # 恢復，且已含剛收完的 T0 那根
+    live.days[pd.Timestamp(T0, unit="ms").date()] = (frozenset({"AAAUSDT"}), True)
+    assert live.on_closed_kline("AAAUSDT", T0, float(up[-1]), has_position=False) == "BUY"
+    assert live.states["AAAUSDT"].last_open_ms == T0

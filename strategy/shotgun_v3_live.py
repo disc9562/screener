@@ -61,20 +61,26 @@ class ShotgunV3Live:
         self.states[symbol] = V.SymbolState.from_history(t, c)
         return True
 
+    def _rewarm_snapshot(self, symbol, open_ms):
+        """從 REST 重建狀態（只抓一次，REST 已含剛收完的這根），回傳這根的 Snapshot；資料不對齊回 None。"""
+        t, c = self._load_1h(symbol)
+        if len(c) < V.SMMA_LENS[-1] + V.ER_LEN or t[-1] != open_ms:
+            return None
+        self.states[symbol] = V.SymbolState.from_history(t, c)
+        s10, s20, s50, s233, er = V.indicators(c)
+        return V.Snapshot(float(c[-1]), s10[-1], s20[-1], s50[-1], s233[-1], er[-1], s10[-2], s20[-2])
+
     def on_closed_kline(self, symbol, open_ms, close, has_position):
         st = self.states.get(symbol)
-        if st is None:
-            return None
-        try:
-            snap = st.update(open_ms, close)
-        except V.GapError as e:
-            logger.warning(f"{symbol}: {e} → re-warmup from REST")
-            t, c = self._load_1h(symbol)                       # 只補抓一次，REST 已含漏掉的 K 棒
-            if len(c) < V.SMMA_LENS[-1] + V.ER_LEN or t[-1] != open_ms:
-                return None
-            self.states[symbol] = V.SymbolState.from_history(t, c)
-            s10, s20, s50, s233, er = V.indicators(c)
-            snap = V.Snapshot(float(c[-1]), s10[-1], s20[-1], s50[-1], s233[-1], er[-1], s10[-2], s20[-2])
+        if st is None:                                         # 之前暖機失敗：這根收完時補一次
+            logger.warning(f"{symbol}: no state → warmup from REST")
+            snap = self._rewarm_snapshot(symbol, open_ms)
+        else:
+            try:
+                snap = st.update(open_ms, close)
+            except V.GapError as e:
+                logger.warning(f"{symbol}: {e} → re-warmup from REST")
+                snap = self._rewarm_snapshot(symbol, open_ms)
         if snap is None:
             return None
         if has_position:
