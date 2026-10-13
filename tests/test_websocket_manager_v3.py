@@ -56,3 +56,9 @@ def test_run_reconnects_and_resubscribes_after_socket_dies():
         m._run()
     assert len(clients) == 2
     clients[1].subscribe.assert_called_once_with(stream=["aaausdt@kline_1h"])
+
+
+def test_futures_stream_uses_routed_market_endpoint():
+    """幣安把合約 stream 拆成 /public、/market、/private（官方 Connect 文件）；沒帶路徑的連線只收得到 public，
+    kline 屬於 /market。2026-10-14 實測：wss://fstream.binance.com/ws 訂閱成功但 70 分鐘 0 則 kline。"""
+    assert W.FUTURES_STREAM_URL == "wss://fstream.binance.com/market"

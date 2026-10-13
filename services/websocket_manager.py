@@ -6,7 +6,9 @@ import time
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from websocket._exceptions import WebSocketConnectionClosedException
 
-FUTURES_STREAM_URL = "wss://fstream.binance.com"     # USDⓈ-M 合約（現貨 client 指到合約網址，訊息格式相同）
+# USDⓈ-M 合約 stream 已拆成 /public、/market、/private；kline 在 /market（沒帶路徑的連線只收得到 public，
+# 訂閱會回成功但永遠沒有 kline）。現貨 client 指到這個網址，訊息格式相同。
+FUTURES_STREAM_URL = "wss://fstream.binance.com/market"
 # 合約 kline 每 ~250ms 推一次未收完的 K 棒；超過這麼久沒有任何訊息就視為連線已死（含 Binance 每 24h 強制斷線）
 STALE_SECONDS = 90
 
