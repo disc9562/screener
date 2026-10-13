@@ -49,8 +49,10 @@ def entry_signal(close, s10, s20, s50, s233, er):
     return bool(np.isfinite(s233) and s10 > s20 > s50 > s233 and close > s10 and er >= ER_MIN)
 
 
-def exit_signal(prev_s10, prev_s20, s10, s20):
-    return bool(prev_s10 >= prev_s20 and s10 < s20)
+def exit_signal(s10, s20):
+    """持倉中 SMMA10 < SMMA20 就出場。進場要求 SMMA10 > SMMA20，所以連續處理時「持倉後第一根 <」
+    就是研究的下穿事件；用狀態判斷則在漏掉交叉那根（停機、斷線）時仍會出場。"""
+    return bool(s10 < s20)
 
 
 def rs_score(close_4h, end):

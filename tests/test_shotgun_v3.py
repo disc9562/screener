@@ -39,8 +39,8 @@ def test_entry_and_exit_rules():
     assert not V.entry_signal(11, 10.5, 10.4, 10.3, 10.0, 0.19)       # ER 不足
     assert not V.entry_signal(10.4, 10.5, 10.4, 10.3, 10.0, 0.5)      # 收盤不在 SMMA10 之上
     assert not V.entry_signal(11, 10.5, 10.4, 10.3, np.nan, 0.5)      # SMMA233 尚未暖機
-    assert V.exit_signal(10.0, 10.0, 9.9, 10.0)                        # 由 ≥ 轉 <
-    assert not V.exit_signal(9.8, 10.0, 9.7, 10.0)                     # 原本就 <，不是事件
+    assert V.exit_signal(9.9, 10.0)                                    # SMMA10 < SMMA20 → 出場
+    assert not V.exit_signal(10.1, 10.0)
 
 
 def _ref_rs(close, end, bars=168, days=28, skip=6):

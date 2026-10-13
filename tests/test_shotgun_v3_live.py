@@ -78,3 +78,16 @@ def test_gap_triggers_rewarm():
     live.now_ms = lambda: T0 + 2 * H
     live.on_closed_kline("AAAUSDT", T0 + H, float(up[-1]), has_position=False)
     assert len(f.calls) == n_calls + 1 and live.states["AAAUSDT"].last_open_ms == T0 + H
+
+
+def test_exit_fires_even_if_cross_bar_was_missed():
+    """I1：交叉發生在停機期間（重啟暖機後已是 SMMA10<SMMA20），持倉時下一根就要出場。"""
+    f = FakeFetcher()
+    up = 100 * np.exp(np.cumsum(np.full(1460, 0.001)))
+    down = up[-1] * np.exp(np.cumsum(np.full(40, -0.01)))
+    f.k1h["AAAUSDT"] = _rows(np.r_[up, down], T0 - 1500 * H, H)
+    live = _live(f, now_ms=T0)
+    assert live.warmup("AAAUSDT")
+    st = live.states["AAAUSDT"]
+    assert st.s[10] < st.s[20]                                  # 交叉已在停機期間發生
+    assert live.on_closed_kline("AAAUSDT", T0, float(down[-1] * 0.99), has_position=True) == "SELL"

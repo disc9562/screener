@@ -20,7 +20,7 @@ def replay_symbol(open_ms, opens, closes, gate_dates, bull_dates):
     days = pd.to_datetime(open_ms, unit="ms").date
     trades, pos = [], None
     for i in range(1, len(closes) - 1):
-        if pos is not None and V.exit_signal(s10[i - 1], s20[i - 1], s10[i], s20[i]):
+        if pos is not None and V.exit_signal(s10[i], s20[i]):
             trades.append((pos[0], int(open_ms[i + 1]), pos[1], float(opens[i + 1])))
             pos = None
             continue

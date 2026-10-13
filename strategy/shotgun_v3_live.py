@@ -78,7 +78,7 @@ class ShotgunV3Live:
         if snap is None:
             return None
         if has_position:
-            return "SELL" if V.exit_signal(snap.prev_s10, snap.prev_s20, snap.s10, snap.s20) else None
+            return "SELL" if V.exit_signal(snap.s10, snap.s20) else None
         lst, bull = self.day_info(open_ms)
         if symbol in lst and bull and V.entry_signal(snap.close, snap.s10, snap.s20, snap.s50, snap.s233, snap.er):
             return "BUY"
