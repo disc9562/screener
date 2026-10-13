@@ -7,6 +7,8 @@ from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from websocket._exceptions import WebSocketConnectionClosedException
 
 FUTURES_STREAM_URL = "wss://fstream.binance.com"     # USDⓈ-M 合約（現貨 client 指到合約網址，訊息格式相同）
+# 合約 kline 每 ~250ms 推一次未收完的 K 棒；超過這麼久沒有任何訊息就視為連線已死（含 Binance 每 24h 強制斷線）
+STALE_SECONDS = 90
 
 class WebSocketManager:
     def __init__(self, api_key, api_secret, notification_service, stream_url=FUTURES_STREAM_URL):
@@ -22,9 +24,11 @@ class WebSocketManager:
         self.symbols = []
         self.interval = '15m'
         self.initial_notification_sent = False # Flag to track initial notification
+        self.last_message_at = 0.0             # time.monotonic() of the last message of any kind
 
     def _message_handler(self, _, message):
         """Callback function to handle incoming websocket messages."""
+        self.last_message_at = time.monotonic()
         try:
             data = json.loads(message)
             # Check for errors first
@@ -65,9 +69,13 @@ class WebSocketManager:
                     self.initial_notification_sent = True
 
                 self.logger.info(f"Successfully subscribed to streams. Waiting for messages.")
-                
-                while self.is_running:
+                self.last_message_at = time.monotonic()
+
+                # binance-connector 的接收執行緒遇到任何例外就結束；這裡要主動偵測並重連
+                while self.is_running and self._healthy():
                     time.sleep(1)
+                if self.is_running:
+                    self.logger.warning(f"WebSocket dead or silent > {STALE_SECONDS}s. Reconnecting...")
 
             except WebSocketConnectionClosedException:
                 self.logger.warning("WebSocket connection lost. Attempting to reconnect in 10 seconds...")
@@ -80,6 +88,12 @@ class WebSocketManager:
                 if self.is_running:
                     time.sleep(10) # Wait before attempting to reconnect
         self.logger.info("WebSocketManager thread stopped.")
+
+    def _healthy(self):
+        sm = getattr(self.ws_client, "socket_manager", None)
+        if sm is not None and not sm.is_alive():
+            return False
+        return time.monotonic() - self.last_message_at <= STALE_SECONDS
 
     def _on_close(self, _):
         self.logger.warning("WebSocket connection closed.")
@@ -102,7 +116,7 @@ class WebSocketManager:
 
     def subscribe(self, symbols: list):
         """Subscribes to additional symbols."""
-        if not self.is_running or not self.ws_client:
+        if not self.is_running:
             self.logger.warning("WebSocket client not started. Cannot subscribe.")
             return
 
@@ -114,6 +128,8 @@ class WebSocketManager:
         self.symbols.extend(new_symbols)
         streams = [f"{symbol.lower()}@kline_{self.interval}" for symbol in new_symbols]
         self.logger.info(f"Subscribing to additional streams: {streams}")
+        if not self.ws_client:                 # 尚未連上：已加入 self.symbols，連上時會一併訂閱
+            return
         try:
             self.ws_client.subscribe(stream=streams)
             self.notification_service.send_subscription_notification(new_symbols, "additional")
