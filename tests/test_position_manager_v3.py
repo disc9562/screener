@@ -87,3 +87,45 @@ def test_cancel_open_orders_also_cancels_conditional_algo_orders():
     svc.cancel_open_orders("AAAUSDT")
     calls = [c.kwargs for c in svc.client.futures_cancel_all_open_orders.call_args_list]
     assert {"symbol": "AAAUSDT"} in calls and {"symbol": "AAAUSDT", "conditional": True} in calls
+
+
+def test_close_position_sells_first_and_cancels_only_after_success():
+    """I4：先送 reduceOnly 賣單（最多 3 次），成功後才撤止損；撤單在賣單之後。"""
+    svc = _svc()
+    events = []
+
+    def create(**kw):
+        events.append("sell")
+        if events.count("sell") < 3:
+            raise Exception("timeout")
+        return {"orderId": 1}
+
+    svc.client.futures_create_order.side_effect = create
+    svc.client.futures_cancel_all_open_orders.side_effect = lambda **kw: events.append("cancel")
+    assert svc.close_position("AAAUSDT", 200.0) == {"orderId": 1}
+    assert events == ["sell", "sell", "sell", "cancel", "cancel"]
+
+
+def test_close_position_keeps_stop_when_sell_keeps_failing():
+    svc = _svc()
+    svc.client.futures_create_order.side_effect = Exception("down")
+    assert svc.close_position("AAAUSDT", 200.0) is None
+    svc.client.futures_cancel_all_open_orders.assert_not_called()
+
+
+def test_stop_placement_retried_then_alerts(tmp_path):
+    oes = MagicMock()
+    oes.place_stop_loss_order.return_value = None
+    pm, notif = _pm(tmp_path, oes)
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
+    assert oes.place_stop_loss_order.call_count == 3
+    assert any("止損" in str(c) for c in notif.send_heartbeat_notification.call_args_list)
+
+
+def test_exchange_close_failure_alerts(tmp_path):
+    oes = MagicMock()
+    oes.close_position.return_value = None
+    pm, notif = _pm(tmp_path, oes)
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
+    pm.close_by_signal("AAAUSDT", 2.2, pd.Timestamp("2026-01-02"))
+    assert any("平倉失敗" in str(c) for c in notif.send_heartbeat_notification.call_args_list)

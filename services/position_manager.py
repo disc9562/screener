@@ -237,7 +237,14 @@ class PositionManager:
         if self.order_execution_service:
             try:
                 entry = self.order_execution_service.place_market_order(symbol, 'BUY', units)
-                sl = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop) if entry else None
+                sl = None
+                for _ in range(3 if entry else 0):
+                    sl = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop)
+                    if sl:
+                        break
+                if entry and not sl:
+                    self.notification_service.send_heartbeat_notification(
+                        message=f"⚠️ {symbol} 已進場但災難止損單掛不上（試 3 次），部位沒有交易所保護，請手動處理")
                 orders = {'entry': entry, 'stop_loss': sl} if entry else None
             except Exception as e:
                 logger.error(f"Testnet order execution error for {symbol}: {e}")
@@ -258,6 +265,9 @@ class PositionManager:
         self.positions_df.loc[i, ['status', 'exit_reason', 'exit_timestamp', 'pnl']] = ['CLOSED', reason, timestamp, pnl]
         self._save_positions()
         orders = self._execute_close_orders(symbol, pos['units'])
+        if self.order_execution_service and not orders:
+            self.notification_service.send_heartbeat_notification(
+                message=f"⚠️ {symbol} 交易所平倉失敗（試 3 次），紙上已記為平倉，交易所多單與止損單仍在，請手動處理")
         self.notification_service.send_trade_notification(
             symbol=symbol, action="SELL", price=price, units=pos['units'], reason=reason, pnl=pnl,
             is_volume_on=False, testnet_orders=orders)

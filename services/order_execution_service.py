@@ -135,11 +135,16 @@ class OrderExecutionService:
                 logger.error(f"Failed to cancel open {'conditional ' if extra else ''}orders for {symbol}: {e}")
         return result
 
-    def close_position(self, symbol: str, quantity: float) -> dict | None:
-        """Close a position: cancel pending orders then reduce-only market sell
-        (if the exchange stop already filled, this is rejected instead of opening a short)."""
-        self.cancel_open_orders(symbol)
-        return self.place_market_order(symbol, 'SELL', quantity, reduce_only=True)
+    def close_position(self, symbol: str, quantity: float, attempts: int = 3) -> dict | None:
+        """Close a position: reduce-only market sell first (safe to retry: it can never open a short),
+        then cancel the remaining orders. If every sell fails, the disaster stop is left in place."""
+        for _ in range(attempts):
+            order = self.place_market_order(symbol, 'SELL', quantity, reduce_only=True)
+            if order:
+                self.cancel_open_orders(symbol)
+                return order
+        logger.error(f"Close failed for {symbol} after {attempts} attempts; stop order left in place")
+        return None
 
     def get_account_balance(self) -> list | None:
         """Get futures account balance."""
