@@ -63,14 +63,45 @@ def handle_kline(message, live, position_manager, cfg):
 
 
 def bootstrap(live, position_manager, now):
-    """啟動：算今天（以及前一天，給 23:00 那根用）的名單與開關，暖機名單 ∪ 持倉。"""
+    """啟動：算今天（以及前一天，給 23:00 那根用）的名單與開關，暖機名單 ∪ 持倉。
+    回傳 (要訂閱的幣, 今日名單是否算成)；算不成時仍暖機持倉，讓出場照常運作。"""
     today = now.normalize()
-    live.daily_rebalance(today - pd.Timedelta(days=1))
-    top, _ = live.daily_rebalance(today)
-    symbols = set(top) | set(position_manager.get_open_positions_symbols())
+    symbols = set(position_manager.get_open_positions_symbols())
+    ok = True
+    try:
+        live.daily_rebalance(today - pd.Timedelta(days=1))
+        top, _ = live.daily_rebalance(today)
+        symbols |= set(top)
+    except Exception as e:
+        logging.error(f"Startup rebalance failed: {e}", exc_info=True)
+        ok = False
     for s in symbols:
         live.warmup(s)
-    return symbols
+    return symbols, ok
+
+
+REBALANCE_RETRY = pd.Timedelta(minutes=5)
+
+
+def rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
+    """換日：算 cutoff 當日的名單與開關。失敗 → 警示並回傳 False（呼叫端不推進 cutoff，5 分鐘後重試；
+    期間當日名單為空 → 不進新倉，但持倉的出場照常）。成功 → 暖機「名單 ∪ 持倉」中沒有狀態的幣、訂閱新幣。"""
+    try:
+        top, bull = live.daily_rebalance(cutoff)
+    except Exception as e:
+        logging.error(f"Daily rebalance {cutoff.date()} failed: {e}", exc_info=True)
+        notification_service.send_heartbeat_notification(
+            message=f"⚠️ {cutoff.date()} 名單計算失敗，5 分鐘後重試：{e}")
+        return False
+    for s in (set(top) | set(position_manager.get_open_positions_symbols())) - set(live.states):
+        live.warmup(s)
+    new = set(top) - subscribed
+    if new:
+        ws.subscribe(sorted(new))
+        subscribed |= new
+    notification_service.send_list_change_notification(added=set(top), removed=set(), webhook_type="general_targets")
+    logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
+    return True
 
 
 def run_app(args):
@@ -90,26 +121,20 @@ def run_app(args):
                                        order_execution_service=_init_order_execution_service())
     live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES)
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-    subscribed = bootstrap(live, position_manager, now)
-    cutoff = next_cutoff(now)
+    subscribed, ok = bootstrap(live, position_manager, now)
+    cutoff = next_cutoff(now) if ok else now.normalize()      # 今日名單沒算成 → 進迴圈後立刻重試
+    retry_at = now
     notification_service.send_list_change_notification(added=set(subscribed), removed=set(), webhook_type="general_targets")
     ws = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
     ws.start(symbols=sorted(subscribed), interval='1h')
     try:
         while True:
             now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-            if now >= cutoff:
-                top, bull = live.daily_rebalance(cutoff)
-                new = set(top) - subscribed
-                for s in new:
-                    live.warmup(s)
-                if new:
-                    ws.subscribe(sorted(new))
-                    subscribed |= new
-                notification_service.send_list_change_notification(
-                    added=set(top), removed=set(), webhook_type="general_targets")
-                logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
-                cutoff = next_cutoff(now)
+            if now >= cutoff and now >= retry_at:
+                if rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
+                    cutoff = next_cutoff(now)
+                else:
+                    retry_at = now + REBALANCE_RETRY
             message = ws.get_message(block=True, timeout=1)
             if message:
                 try:

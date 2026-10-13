@@ -104,3 +104,26 @@ def test_failed_warmup_is_retried_on_next_kline():
     live.days[pd.Timestamp(T0, unit="ms").date()] = (frozenset({"AAAUSDT"}), True)
     assert live.on_closed_kline("AAAUSDT", T0, float(up[-1]), has_position=False) == "BUY"
     assert live.states["AAAUSDT"].last_open_ms == T0
+
+
+def test_daily_rebalance_refuses_incomplete_data():
+    """I3：母體抓不到大半、或 BTC 日線不足 1000 根時，不得悄悄用殘缺資料決定整天。"""
+    import pytest
+    from strategy.shotgun_v3_live import RebalanceIncomplete
+
+    class Flaky(FakeFetcher):
+        def fetch_klines(self, symbol, interval, limit):
+            if interval == "4h" and symbol != "AAAUSDT":
+                return None
+            return super().fetch_klines(symbol, interval, limit)
+
+    with pytest.raises(RebalanceIncomplete):
+        _live(Flaky()).daily_rebalance(pd.Timestamp(T0, unit="ms"))
+
+    class ShortBtc(FakeFetcher):
+        def fetch_klines(self, symbol, interval, limit):
+            rows = super().fetch_klines(symbol, interval, limit)
+            return rows[-500:] if interval == "1d" else rows
+
+    with pytest.raises(RebalanceIncomplete):
+        _live(ShortBtc()).daily_rebalance(pd.Timestamp(T0, unit="ms"))

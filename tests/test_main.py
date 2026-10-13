@@ -33,8 +33,8 @@ def test_bootstrap_subscribes_open_positions():
     live, pm = MagicMock(), MagicMock()
     live.daily_rebalance.return_value = (["AAAUSDT"], True)
     pm.get_open_positions_symbols.return_value = ["ZZZUSDT"]
-    syms = main.bootstrap(live, pm, pd.Timestamp("2026-01-01 05:00"))
-    assert syms == {"AAAUSDT", "ZZZUSDT"}
+    syms, ok = main.bootstrap(live, pm, pd.Timestamp("2026-01-01 05:00"))
+    assert ok and syms == {"AAAUSDT", "ZZZUSDT"}
     warmed = {c.args[0] for c in live.warmup.call_args_list}
     assert warmed == {"AAAUSDT", "ZZZUSDT"}
     assert live.daily_rebalance.call_args_list[-1].args[0] == pd.Timestamp("2026-01-01")
@@ -43,3 +43,32 @@ def test_bootstrap_subscribes_open_positions():
 def test_websocket_defaults_to_futures_stream():
     ws = WebSocketManager("k", "s", MagicMock())
     assert ws.stream_url == FUTURES_STREAM_URL
+
+
+def test_rollover_failure_alerts_and_keeps_cutoff():
+    live, pm, ws, notif = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    live.daily_rebalance.side_effect = RuntimeError("binance down")
+    assert main.rollover(live, pm, ws, notif, pd.Timestamp("2026-01-02"), set()) is False
+    assert notif.send_heartbeat_notification.called
+    ws.subscribe.assert_not_called()
+
+
+def test_rollover_success_warms_missing_and_subscribes_new():
+    live, pm, ws, notif = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+    live.daily_rebalance.return_value = (["AAAUSDT", "BBBUSDT"], True)
+    live.states = {"AAAUSDT": object()}
+    pm.get_open_positions_symbols.return_value = ["ZZZUSDT"]
+    subscribed = {"AAAUSDT", "ZZZUSDT"}
+    assert main.rollover(live, pm, ws, notif, pd.Timestamp("2026-01-02"), subscribed) is True
+    assert {c.args[0] for c in live.warmup.call_args_list} == {"BBBUSDT", "ZZZUSDT"}
+    ws.subscribe.assert_called_once_with(["BBBUSDT"])
+    assert subscribed == {"AAAUSDT", "BBBUSDT", "ZZZUSDT"}
+
+
+def test_bootstrap_survives_rebalance_failure():
+    live, pm = MagicMock(), MagicMock()
+    live.daily_rebalance.side_effect = RuntimeError("binance down")
+    pm.get_open_positions_symbols.return_value = ["ZZZUSDT"]
+    syms, ok = main.bootstrap(live, pm, pd.Timestamp("2026-01-01 05:00"))
+    assert ok is False and syms == {"ZZZUSDT"}
+    live.warmup.assert_called_once_with("ZZZUSDT")

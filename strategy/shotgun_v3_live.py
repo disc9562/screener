@@ -10,6 +10,14 @@ from strategy import shotgun_v3 as V
 logger = logging.getLogger(__name__)
 
 
+MIN_UNIVERSE_COVERAGE = 0.9          # 4h 資料抓到的幣 ≥ 母體 90% 才算完整
+MIN_BTC_DAYS = 1000
+
+
+class RebalanceIncomplete(Exception):
+    """換日資料不完整：不得用殘缺母體或殘缺 BTC 日線決定一整天。"""
+
+
 def _closed(rows, now_ms):
     """去掉還沒收完的最後一根（close_time >= 現在）。"""
     return [r for r in rows if int(r[6]) < now_ms]
@@ -30,16 +38,24 @@ class ShotgunV3Live:
 
     def daily_rebalance(self, cutoff):
         cut_ms = int(cutoff.value // 1_000_000)
-        scores = {}
-        for sym in self._universe():
-            rows = [r for r in (self.fetcher.fetch_klines(sym, "4h", 300) or []) if int(r[0]) < cut_ms]
+        universe = self._universe()
+        scores, fetched = {}, 0
+        for sym in universe:
+            raw = self.fetcher.fetch_klines(sym, "4h", 300)
+            if raw:
+                fetched += 1
+            rows = [r for r in (raw or []) if int(r[0]) < cut_ms]
             if rows:
                 sc = V.rs_score(np.array([float(r[4]) for r in rows]), len(rows) - 1)
                 if sc is not None:
                     scores[sym] = sc
+        if not universe or fetched < MIN_UNIVERSE_COVERAGE * len(universe):
+            raise RebalanceIncomplete(f"4h data for {fetched}/{len(universe)} symbols")
         top = V.rank_top(scores)
         btc = [r for r in (self.fetcher.fetch_klines("BTCUSDT", "1d", 1500) or []) if int(r[0]) < cut_ms]
-        bull = V.btc_bull([float(r[4]) for r in btc]) if len(btc) >= 1000 else False
+        if len(btc) < MIN_BTC_DAYS:
+            raise RebalanceIncomplete(f"BTC daily bars {len(btc)} < {MIN_BTC_DAYS}")
+        bull = V.btc_bull([float(r[4]) for r in btc])
         self.days[cutoff.date()] = (frozenset(top), bull)
         for d in sorted(self.days)[:-3]:
             del self.days[d]
