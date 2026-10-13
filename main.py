@@ -13,42 +13,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 from config import (
     get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET,
     USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET,
+    NOTIONAL_PCT, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, EQUITY_LIKE_BASES, POSITIONS_CSV_V3,
 )
-from data.transformer import transform_crypto_data
 from data.fetcher import CryptoFetcher
-from strategy.strong_target_screener import StrongTargetScreener
-from strategy.alligator_strategy import AlligatorStrategy
+from strategy.shotgun_v3_live import ShotgunV3Live
 from services.position_manager import PositionManager
 from services.websocket_manager import WebSocketManager
 from services.notification_service import NotificationService
 from services.order_execution_service import OrderExecutionService
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='application.log', filemode='w')
-
-
-def process_kline_message(symbol: str, kline: dict, position_manager: PositionManager,
-                          alligator_strategy: AlligatorStrategy, strong_targets: set,
-                          is_volume_on: bool):
-    """Processes a single kline for a given strategy in a stateful manner."""
-    try:
-        latest_price = pd.Series({
-            'Datetime': pd.to_datetime(kline['t'], unit='ms'),
-            'High': float(kline['h']),
-            'Low': float(kline['l']),
-            'Close': float(kline['c']),
-        })
-        position_manager.update_positions({symbol: latest_price})
-
-        if symbol not in strong_targets:
-            return
-
-        signal = alligator_strategy.run_with_kline(symbol, kline)
-        if signal and symbol not in position_manager.get_open_positions_symbols():
-            logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {signal}")
-            position_manager.open_position(symbol, signal)
-
-    except Exception as e:
-        logging.error(f"Error in process_kline_message for {symbol}: {e}", exc_info=True)
 
 
 def _init_order_execution_service():
@@ -67,155 +41,87 @@ def _init_order_execution_service():
         return None
 
 
-def run_app(args):
-    logging.info("Application starting...")
+def next_cutoff(now: pd.Timestamp) -> pd.Timestamp:
+    return now.normalize() + pd.Timedelta(days=1)
 
+
+def handle_kline(message, live, position_manager, cfg):
+    """收完的 1h K 棒：先用低點檢查紙上災難止損，再交給策略判斷 BUY/SELL。"""
+    k, symbol = message['k'], message['s']
+    open_ms, close = int(k['t']), float(k['c'])
+    ts = pd.to_datetime(open_ms, unit='ms') + pd.Timedelta(hours=1)
+    if symbol in position_manager.get_open_positions_symbols():
+        position_manager.update_positions({symbol: pd.Series({
+            'Datetime': ts, 'High': float(k['h']), 'Low': float(k['l']), 'Close': close})})
+    has_position = symbol in position_manager.get_open_positions_symbols()
+    action = live.on_closed_kline(symbol, open_ms, close, has_position)
+    if action == "SELL":
+        position_manager.close_by_signal(symbol, close, ts, "CROSS_10_20")
+    elif action == "BUY":
+        position_manager.open_notional(symbol, close, ts, cfg["NOTIONAL_PCT"], cfg["DISASTER_STOP_PCT"])
+    return action
+
+
+def bootstrap(live, position_manager, now):
+    """啟動：算今天（以及前一天，給 23:00 那根用）的名單與開關，暖機名單 ∪ 持倉。"""
+    today = now.normalize()
+    live.daily_rebalance(today - pd.Timedelta(days=1))
+    top, _ = live.daily_rebalance(today)
+    symbols = set(top) | set(position_manager.get_open_positions_symbols())
+    for s in symbols:
+        live.warmup(s)
+    return symbols
+
+
+def run_app(args):
+    logging.info("Shotgun v3 starting...")
     strategy_config = get_strategy_config()
     webhook_on = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_ON")
     webhook_off = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_OFF")
     if not webhook_on or not webhook_off:
         logging.error("Error: Both DISCORD_WEBHOOK_URL_VOLUME_ON and DISCORD_WEBHOOK_URL_VOLUME_OFF must be configured.")
         sys.exit(1)
-
     notification_service = NotificationService(webhook_urls_map={
-        "volume_on": webhook_on,
-        "volume_off": webhook_off,
+        "volume_on": webhook_on, "volume_off": webhook_off,
         "general_targets": strategy_config.get("DISCORD_WEBHOOK_URL_GENERAL_TARGETS"),
     })
-
-    order_execution_service = _init_order_execution_service()
-
-    # Instantiate two strategy/position manager pairs
-    strategy_config_volume_on = {**strategy_config, "use_volume_condition": True}
-    position_manager_volume_on = PositionManager(notification_service, strategy_config_volume_on, 'data/positions_volume_on.csv', order_execution_service=order_execution_service)
-    alligator_strategy_volume_on = AlligatorStrategy(strategy_config_volume_on)
-
-    strategy_config_volume_off = {**strategy_config, "use_volume_condition": False}
-    position_manager_volume_off = PositionManager(notification_service, strategy_config_volume_off, 'data/positions_volume_off.csv', order_execution_service=order_execution_service)
-    alligator_strategy_volume_off = AlligatorStrategy(strategy_config_volume_off)
-
-    strategy_pairs = {
-        "volume_on": {"position_manager": position_manager_volume_on, "alligator_strategy": alligator_strategy_volume_on, "strong_targets": set(), "is_volume_on": True},
-        "volume_off": {"position_manager": position_manager_volume_off, "alligator_strategy": alligator_strategy_volume_off, "strong_targets": set(), "is_volume_on": False}
-    }
-    
-    screener = StrongTargetScreener({**strategy_config, 'local_test_mode': getattr(args, 'local_test', False)})
-
-    # Fetch initial strong targets
-    logging.info("Performing initial screening for strong targets...")
-    strong_targets_with_scores = screener.run_screener()
-    top_20_targets = {item[0] for item in strong_targets_with_scores}
-
-    logging.info("Starting warmup phase for strategies...")
-    crypto_fetcher = CryptoFetcher()
-    for symbol in top_20_targets:
-        try:
-            historical_klines = crypto_fetcher.fetch_klines(symbol, '15m', limit=250)
-            if not historical_klines:
-                logging.warning(f"No historical k-lines found for {symbol} during warmup.")
-                continue
-            historical_df = transform_crypto_data(historical_klines)
-            if historical_df.empty:
-                logging.warning(f"Could not generate DataFrame for {symbol} during warmup.")
-                continue
-            for pair in strategy_pairs.values():
-                pair["alligator_strategy"].warmup(symbol, historical_df)
-        except Exception as e:
-            logging.error(f"Failed to fetch/warmup for {symbol}: {e}", exc_info=True)
-
-    # Assign targets and notify
-    for pair in strategy_pairs.values():
-        pair["strong_targets"] = top_20_targets
-        notification_service.send_list_change_notification(added=top_20_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False))
-    notification_service.send_list_change_notification(added=top_20_targets, removed=set(), webhook_type="general_targets", is_local_test=getattr(args, 'local_test', False))
-
-    open_symbols_on = set(position_manager_volume_on.get_open_positions_symbols())
-    open_symbols_off = set(position_manager_volume_off.get_open_positions_symbols())
-    symbols_to_subscribe = list(top_20_targets | open_symbols_on | open_symbols_off)
-
-    if getattr(args, 'local_test', False):
-        logging.warning("Local test mode is not supported with the new stateful architecture. Exiting.")
-        return
-
-    ws_manager = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
-    ws_manager.start(symbols=symbols_to_subscribe, interval='15m')
-
-    logging.info("Entering main processing loop...")
-    last_heartbeat_minute = -1
-    fetched_times_today = set()
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
+    cfg = {"NOTIONAL_PCT": NOTIONAL_PCT, "DISASTER_STOP_PCT": DISASTER_STOP_PCT}
+    position_manager = PositionManager(notification_service, strategy_config, POSITIONS_CSV_V3,
+                                       order_execution_service=_init_order_execution_service())
+    live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES)
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    subscribed = bootstrap(live, position_manager, now)
+    cutoff = next_cutoff(now)
+    notification_service.send_list_change_notification(added=set(subscribed), removed=set(), webhook_type="general_targets")
+    ws = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
+    ws.start(symbols=sorted(subscribed), interval='1h')
     try:
         while True:
-            now = datetime.now()
-            # Reset fetched times at the start of a new day
-            current_day_str = now.strftime("%Y-%m-%d")
-            if current_day_str != today_str:
-                fetched_times_today = set()
-                today_str = current_day_str
-                logging.info("New day, resetting scheduled fetch times.")
-
-            # Scheduled re-screening logic
-            for fetch_time_str in strategy_config.get("TARGET_FETCH_TIMES", []):
-                fetch_hour, fetch_minute = map(int, fetch_time_str.split(':'))
-                if now.hour == fetch_hour and now.minute == fetch_minute and (today_str, fetch_time_str) not in fetched_times_today:
-                    logging.info(f"Scheduled re-running screener for {fetch_time_str}...")
-                    strong_targets_with_scores = screener.run_screener()
-                    new_top_20_targets = {item[0] for item in strong_targets_with_scores}
-
-                    for pair in strategy_pairs.values():
-                        current_symbols = pair["strong_targets"]
-                        added = new_top_20_targets - current_symbols
-                        removed = current_symbols - new_top_20_targets
-                        
-                        if added:
-                            logging.info(f"New symbols to subscribe to for strategy: {added}")
-                            ws_manager.subscribe(list(added))
-                        
-                        if added or removed:
-                            notification_service.send_list_change_notification(
-                                added=added, removed=removed, is_volume_on=pair["is_volume_on"], is_local_test=False
-                            )
-                        pair["strong_targets"] = new_top_20_targets
-
-                    notification_service.send_list_change_notification(
-                        added=new_top_20_targets, removed=set(), webhook_type="general_targets", is_local_test=False
-                    )
-                    
-                    fetched_times_today.add((today_str, fetch_time_str))
-
-            # Heartbeat notification
-            current_minute = now.minute
-            if current_minute % 15 == 0 and current_minute != last_heartbeat_minute:
-                if not position_manager_volume_on.get_open_positions_symbols() and not position_manager_volume_off.get_open_positions_symbols():
-                    logging.info("HEARTBEAT_CHECK: No open positions. Sending notification.")
-                    notification_service.send_heartbeat_notification(message="沒有艙位")
-                last_heartbeat_minute = current_minute
-
-            try:
-                message = ws_manager.get_message(block=False)
-                if message:
-                    kline = message['k']
-                    symbol = message['s']
-                    for pair in strategy_pairs.values():
-                        process_kline_message(
-                            symbol, kline,
-                            pair["position_manager"],
-                            pair["alligator_strategy"],
-                            pair["strong_targets"],
-                            pair["is_volume_on"],
-                        )
-            except queue.Empty:
-                pass
-
-            time.sleep(1)
-
+            now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+            if now >= cutoff:
+                top, bull = live.daily_rebalance(cutoff)
+                new = set(top) - subscribed
+                for s in new:
+                    live.warmup(s)
+                if new:
+                    ws.subscribe(sorted(new))
+                    subscribed |= new
+                notification_service.send_list_change_notification(
+                    added=set(top), removed=set(), webhook_type="general_targets")
+                logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
+                cutoff = next_cutoff(now)
+            message = ws.get_message(block=True, timeout=1)
+            if message:
+                try:
+                    handle_kline(message, live, position_manager, cfg)
+                except Exception as e:
+                    logging.error(f"handle_kline failed for {message.get('s')}: {e}", exc_info=True)
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")
     finally:
-        logging.info("Stopping WebSocket Manager...")
-        ws_manager.stop()
+        ws.stop()
         logging.info("Application stopped.")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Crypto Screener Bot")

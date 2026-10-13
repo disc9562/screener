@@ -6,8 +6,11 @@ import time
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
 from websocket._exceptions import WebSocketConnectionClosedException
 
+FUTURES_STREAM_URL = "wss://fstream.binance.com"     # USDⓈ-M 合約（現貨 client 指到合約網址，訊息格式相同）
+
 class WebSocketManager:
-    def __init__(self, api_key, api_secret, notification_service):
+    def __init__(self, api_key, api_secret, notification_service, stream_url=FUTURES_STREAM_URL):
+        self.stream_url = stream_url
         self.api_key = api_key
         self.api_secret = api_secret
         self.notification_service = notification_service
@@ -45,7 +48,8 @@ class WebSocketManager:
         while self.is_running:
             try:
                 self.logger.info(f"Attempting to connect and subscribe to {len(self.symbols)} symbols...")
-                self.ws_client = SpotWebsocketStreamClient(on_message=self._message_handler, on_close=self._on_close, on_error=self._on_error)
+                self.ws_client = SpotWebsocketStreamClient(stream_url=self.stream_url, on_message=self._message_handler,
+                                                           on_close=self._on_close, on_error=self._on_error)
                 
                 if not self.symbols:
                     self.logger.warning("No symbols to subscribe to. Waiting...")
