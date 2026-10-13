@@ -127,7 +127,7 @@ class TestPlaceStopLossOrder:
             type='STOP_MARKET',
             quantity=0.5,
             stopPrice=60000.0,
-            closePosition='false',
+            reduceOnly='true',
         )
 
     def test_failure_returns_none(self, service, mock_client):
@@ -149,7 +149,7 @@ class TestPlaceTakeProfitOrder:
             type='TAKE_PROFIT_MARKET',
             quantity=0.5,
             stopPrice=80000.0,
-            closePosition='false',
+            reduceOnly='true',
         )
 
 
@@ -181,6 +181,7 @@ class TestClosePosition:
             side='SELL',
             type='MARKET',
             quantity=0.5,
+            reduceOnly='true',
         )
 
 

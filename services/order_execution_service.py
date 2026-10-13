@@ -79,17 +79,15 @@ class OrderExecutionService:
             return round(price, info['pricePrecision'])
         return round(price, 2)
 
-    def place_market_order(self, symbol: str, side: str, quantity: float) -> dict | None:
-        """Place a market order on futures testnet."""
+    def place_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False) -> dict | None:
+        """Place a market order on futures testnet. reduce_only=True can never open/flip a position."""
         qty = self._round_quantity(symbol, quantity)
+        params = dict(symbol=symbol, side=side, type='MARKET', quantity=qty)
+        if reduce_only:
+            params["reduceOnly"] = "true"
         try:
-            order = self.client.futures_create_order(
-                symbol=symbol,
-                side=side,
-                type='MARKET',
-                quantity=qty,
-            )
-            logger.info(f"Market {side} order placed: {symbol} qty={qty} orderId={order.get('orderId')}")
+            order = self.client.futures_create_order(**params)
+            logger.info(f"Market {side} order placed: {symbol} qty={qty} reduceOnly={reduce_only} orderId={order.get('orderId')}")
             return order
         except Exception as e:
             logger.error(f"Failed to place market {side} order for {symbol}: {e}")
@@ -108,7 +106,7 @@ class OrderExecutionService:
                 type=order_type,
                 quantity=qty,
                 stopPrice=price,
-                closePosition='false',
+                reduceOnly='true',
             )
             logger.info(f"{label} order placed: {symbol} side={side} stopPrice={price} orderId={order.get('orderId')}")
             return order
@@ -135,9 +133,10 @@ class OrderExecutionService:
             return None
 
     def close_position(self, symbol: str, quantity: float) -> dict | None:
-        """Close a position: cancel pending orders then market sell."""
+        """Close a position: cancel pending orders then reduce-only market sell
+        (if the exchange stop already filled, this is rejected instead of opening a short)."""
         self.cancel_open_orders(symbol)
-        return self.place_market_order(symbol, 'SELL', quantity)
+        return self.place_market_order(symbol, 'SELL', quantity, reduce_only=True)
 
     def get_account_balance(self) -> list | None:
         """Get futures account balance."""

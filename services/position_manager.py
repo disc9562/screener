@@ -212,3 +212,50 @@ class PositionManager:
 
         if positions_closed:
             self._save_positions()
+
+    # --- Shotgun v3 ---
+    def paper_equity(self) -> float:
+        closed = self.positions_df[self.positions_df['status'] == 'CLOSED'] if not self.positions_df.empty else self.positions_df
+        realized = float(pd.to_numeric(closed['pnl'], errors='coerce').fillna(0).sum()) if len(closed) else 0.0
+        return float(self.strategy_config.get('TOTAL_CAPITAL')) + realized
+
+    def open_notional(self, symbol, price, timestamp, notional_pct, disaster_stop_pct) -> bool:
+        if symbol in self.get_open_positions_symbols():
+            logger.info(f"Position for {symbol} is already open. Ignoring BUY.")
+            return False
+        units = self.paper_equity() * notional_pct / price
+        stop = price * (1 - disaster_stop_pct)
+        row = {'symbol': symbol, 'status': 'OPEN', 'entry_price': price, 'stop_loss': stop,
+               'take_profit': float('nan'), 'units': units, 'entry_timestamp': timestamp,
+               'exit_timestamp': pd.NaT, 'exit_reason': None, 'pnl': -self._opening_fee(price, units)}
+        self.positions_df = pd.concat([self.positions_df, pd.DataFrame([row])], ignore_index=True)
+        self._save_positions()
+        orders = None
+        if self.order_execution_service:
+            try:
+                entry = self.order_execution_service.place_market_order(symbol, 'BUY', units)
+                sl = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop) if entry else None
+                orders = {'entry': entry, 'stop_loss': sl} if entry else None
+            except Exception as e:
+                logger.error(f"Testnet order execution error for {symbol}: {e}")
+        self.notification_service.send_trade_notification(
+            symbol=symbol, action="BUY", price=price, units=units, stop_loss_price=stop,
+            is_volume_on=False, testnet_orders=orders)
+        return True
+
+    def close_by_signal(self, symbol, price, timestamp, reason="CROSS_10_20") -> bool:
+        idx = self.positions_df[(self.positions_df['symbol'] == symbol) & (self.positions_df['status'] == 'OPEN')].index
+        if idx.empty:
+            return False
+        i = idx[0]
+        pos = self.positions_df.loc[i]
+        fee = self.strategy_config.get('TRANSACTION_FEE_PERCENT')
+        pnl = (price - pos['entry_price']) * pos['units'] - self._opening_fee(pos['entry_price'], pos['units']) \
+            - price * pos['units'] * fee
+        self.positions_df.loc[i, ['status', 'exit_reason', 'exit_timestamp', 'pnl']] = ['CLOSED', reason, timestamp, pnl]
+        self._save_positions()
+        orders = self._execute_close_orders(symbol, pos['units'])
+        self.notification_service.send_trade_notification(
+            symbol=symbol, action="SELL", price=price, units=pos['units'], reason=reason, pnl=pnl,
+            is_volume_on=False, testnet_orders=orders)
+        return True
