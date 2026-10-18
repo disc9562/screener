@@ -6,7 +6,7 @@ from binance.exceptions import BinanceAPIException
 import requests # New import for handling connection errors
 from polygon import RESTClient
 from urllib3.util.retry import Retry
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 import threading
 from collections import deque
 
@@ -57,6 +57,19 @@ class WeightLimiter:
 
 _LIMITER = WeightLimiter()
 
+_NETWORK_ERRORS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+
+
+def _give_up(default):
+    """tenacity 重試用完：網路錯誤 → 回傳 default（呼叫端照舊當成「沒資料」）；限速等其他錯誤 → 照原本拋 RetryError。"""
+    def callback(state):
+        exc = state.outcome.exception()
+        if isinstance(exc, _NETWORK_ERRORS):
+            print(f"Network error after {state.attempt_number} attempts: {exc}")
+            return default
+        raise RetryError(state.outcome)
+    return callback
+
 
 def _rate_limited(exc):
     """429/418 (code -1003): pause every thread for Retry-After before tenacity retries."""
@@ -101,7 +114,8 @@ class CryptoFetcher(BaseFetcher):
         return result
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
-           retry=retry_if_exception_type((BinanceAPIException, requests.exceptions.ConnectionError, requests.exceptions.Timeout)))
+           retry=retry_if_exception_type((BinanceAPIException, requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+           retry_error_callback=_give_up(None))
     def fetch_klines(self, symbol, interval="15m", limit=1500):
         if not self.client:
             return None
@@ -117,12 +131,15 @@ class CryptoFetcher(BaseFetcher):
             else:
                 print(f"Error fetching klines for {symbol}: {e}")
                 return None
+        except _NETWORK_ERRORS:
+            raise                       # 交給 tenacity 重試（原本被下面的 except 吞掉，重試從沒觸發過）
         except Exception as e:
             print(f"Error fetching klines for {symbol}: {e}")
             return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
-           retry=retry_if_exception_type((BinanceAPIException, requests.exceptions.ConnectionError, requests.exceptions.Timeout)))
+           retry=retry_if_exception_type((BinanceAPIException, requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+           retry_error_callback=_give_up([]))
     def get_all_symbols(self):
         """USDT-margined perpetuals that are currently TRADING (excludes delisted/settled contracts and quarterlies)."""
         if not self.client:
@@ -140,6 +157,8 @@ class CryptoFetcher(BaseFetcher):
             else:
                 print(f"Error fetching crypto symbols from Binance: {e}")
                 return []
+        except _NETWORK_ERRORS:
+            raise
         except Exception as e:
             print(f"Error fetching crypto symbols from Binance: {e}")
             return []

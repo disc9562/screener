@@ -169,3 +169,16 @@ def test_get_all_symbols_only_trading_usdt_perpetuals(mock_binance_client):
     fetcher = CryptoFetcher()
     fetcher.client = mock_binance_client
     assert fetcher.get_all_symbols() == ["BTCUSDT"]
+
+
+def test_network_errors_are_retried_then_return_none(mock_binance_client):
+    import requests
+    from tenacity import wait_none
+    fetcher = CryptoFetcher()
+    fetcher.client = mock_binance_client
+    fetch = F.CryptoFetcher.fetch_klines.retry_with(wait=wait_none())
+    mock_binance_client.futures_klines.side_effect = [requests.exceptions.ConnectionError("reset"), [[1]]]
+    assert fetch(fetcher, "BTCUSDT", limit=200) == [[1]]                     # 斷線一次 → 重試成功
+    mock_binance_client.futures_klines.side_effect = requests.exceptions.Timeout("slow")
+    assert fetch(fetcher, "BTCUSDT", limit=200) is None                      # 重試用完 → None，不拋例外（呼叫端行為不變）
+    assert mock_binance_client.futures_klines.call_count == 2 + 3

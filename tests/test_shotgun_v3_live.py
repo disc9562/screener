@@ -164,3 +164,16 @@ def test_shadow_logs_full_universe_with_separate_fetcher():
     assert set(rows) == set(live.rows_4h)                          # 全母體，不只記名單上的
     assert rows["BTCUSDT"]["st1"] == "fetch_failed" and rows["BTCUSDT"]["ladder_complete"] is False
     assert not any(c[1] == "1h" for c in f.calls)                  # 影子的 1h 抓取不走交易用的 fetcher
+
+
+def test_shadow_keeps_symbols_whose_4h_failed_and_records_age():
+    f = FakeFetcher()
+    f.k1h["AAAUSDT"] = _rows(100 * np.exp(np.cumsum(np.full(200, 0.002))), T0 - 200 * H, H)
+    f.k1h["BBBUSDT"] = _rows(np.full(200, 100.0), T0 - 200 * H, H)
+    rows4 = {"AAAUSDT": f.fetch_klines("AAAUSDT", "4h", 300)}                # BBB 換日時 4h 沒抓到
+    live = _live(f)
+    by = {r["symbol"]: r for r in live.shadow_snapshot(pd.Timestamp(T0, unit="ms"), ["AAAUSDT"], rows4,
+                                                        universe=["AAAUSDT", "BBBUSDT"])}
+    assert set(by) == {"AAAUSDT", "BBBUSDT"}
+    assert by["BBBUSDT"]["st4"] == "fetch_failed" and by["BBBUSDT"]["martin_status"] == "fetch_failed"
+    assert by["AAAUSDT"]["age1"] == 0 and by["AAAUSDT"]["age24"] == 0       # 最後一根就是 cutoff 前剛收完的

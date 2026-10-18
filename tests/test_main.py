@@ -105,7 +105,7 @@ def test_shadow_rows_appended_with_single_header():
     live = MagicMock()
     live.daily_rebalance.return_value = (["AAAUSDT"], True)
     live.states = {}
-    live.shadow_snapshot.side_effect = lambda cutoff, top, rows: [{"date": str(cutoff.date()), "symbol": "AAAUSDT", "s1": 0.2}]
+    live.shadow_snapshot.side_effect = lambda cutoff, top, rows, **kw: [{"date": str(cutoff.date()), "symbol": "AAAUSDT", "s1": 0.2}]
     pm, ws, notif = MagicMock(), MagicMock(), MagicMock()
     pm.get_open_positions_symbols.return_value = []
     for day in ("2026-01-02", "2026-01-03", "2026-01-03"):           # 第二次 01-03 是重跑，不能重複寫
@@ -169,3 +169,26 @@ def test_shadow_worker_survives_errors_and_runs_in_order():
     main._SHADOW_Q.put(lambda: done.append("next"))                 # 後面的照常執行
     main._SHADOW_Q.join()
     assert done == ["next"]
+
+
+def test_entry_job_records_exchange_fill():
+    live, pm = MagicMock(), MagicMock()
+    pm.get_open_positions_symbols.return_value = []
+    pm.open_notional.return_value = {"exchange": "filled", "order_id": 7, "fill_price": 2.01}
+    live.on_closed_kline.return_value = "BUY"
+    live.entry_features.return_value = {"s1": 0.3}
+    main.handle_kline(_msg("AAAUSDT", 0, c=2.0), live, pm, {"NOTIONAL_PCT": 0.04, "DISASTER_STOP_PCT": 0.2})
+    row = pd.read_csv(main.SHADOW_ENTRIES_CSV).iloc[0]
+    assert row["exchange"] == "filled" and row["order_id"] == 7 and row["fill_price"] == 2.01
+
+
+def test_drain_shadow_waits_then_gives_up():
+    import threading
+    threading.Thread(target=main._shadow_worker, daemon=True).start()
+    done, gate = [], threading.Event()
+    main._SHADOW_Q.put(lambda: done.append(1))
+    assert main._drain_shadow(timeout=2) is True and done == [1]
+    main._SHADOW_Q.put(gate.wait)                                          # 卡住的工作 → 時間到就放棄，不讓程式關不掉
+    assert main._drain_shadow(timeout=0.3) is False
+    gate.set()
+    main._SHADOW_Q.join()

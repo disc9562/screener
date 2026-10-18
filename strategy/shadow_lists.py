@@ -79,14 +79,15 @@ def ladder(slopes, status, theta=THETA):
 
 def features(rows_1h, rows_4h, cut_ms):
     """一個幣在 cut_ms 當下的影子特徵：1/2h 斜率用 1h 資料，4/8/12/24h 斜率與 Martin30 用 4h 資料；每項都附狀態。"""
-    slope, status = {}, {}
+    slope, status, age = {}, {}, {}
     for h in TFS:
         base, rows = (1, rows_1h) if h < 4 else (4, rows_4h)
         ids, _, hi, lo, c = resample(rows, base, h, cut_ms)
         status[h] = series_status(ids, h, cut_ms, NEED, had_rows=bool(rows))
+        age[h] = (cut_ms - (int(ids[-1]) + 1) * h * HOUR_MS) / HOUR_MS if len(ids) else np.nan   # 最後一根收完距 cutoff 幾小時
         slope[h] = ema_slope(hi, lo, c) if status[h] == "ok" else np.nan
     ids, *_, daily = resample(rows_4h, 4, 24, cut_ms)
     m_status = series_status(ids, 24, cut_ms, NEED_MARTIN, had_rows=bool(rows_4h))
     r30, ok = martin30(daily) if m_status == "ok" else (np.nan, False)
     lad, complete = ladder(slope, status)
-    return dict(slope=slope, status=status, r30=r30, martin_ok=ok, martin_status=m_status, ladder=lad, ladder_complete=complete)
+    return dict(slope=slope, status=status, age=age, r30=r30, martin_ok=ok, martin_status=m_status, ladder=lad, ladder_complete=complete)

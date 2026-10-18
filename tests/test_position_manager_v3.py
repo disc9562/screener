@@ -159,3 +159,30 @@ def test_open_notional_sets_cross_margin_before_entry(tmp_path):
     pm, _ = _pm(tmp_path, oes)
     pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
     assert order == ["margin", "buy"]
+
+
+def test_exchange_entry_failure_rolls_back_paper_position(tmp_path):
+    for i, fail in enumerate((dict(return_value=None), dict(side_effect=RuntimeError("timeout")))):
+        oes = MagicMock()
+        oes.place_market_order.configure_mock(**fail)
+        pm, notif = _pm(tmp_path / str(i), oes)
+        assert not pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
+        assert pm.get_open_positions_symbols() == [] and len(pm.positions_df) == 0   # 交易所沒倉 → 紙上也不留
+        assert notif.send_heartbeat_notification.called
+        oes.place_stop_loss_order.assert_not_called()
+
+
+def test_entry_records_order_id_and_fill_price(tmp_path):
+    oes = MagicMock()
+    oes.place_market_order.return_value = {"orderId": 7, "avgPrice": "2.01", "status": "FILLED"}
+    pm, _ = _pm(tmp_path, oes)
+    info = pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)
+    assert info == {"exchange": "filled", "order_id": 7, "fill_price": 2.01}
+    pm2, _ = _pm(tmp_path, oes)                                                  # 重新讀 CSV 也還在
+    row = pm2.positions_df.iloc[-1]
+    assert str(row["entry_order_id"]) == "7" and float(row["entry_fill_price"]) == 2.01
+
+
+def test_paper_only_mode_reports_exchange_disabled(tmp_path):
+    pm, _ = _pm(tmp_path)
+    assert pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)["exchange"] == "disabled"

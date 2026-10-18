@@ -9,7 +9,8 @@ logger = logging.getLogger(__name__)
 
 POSITION_COLUMNS = [
     'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit',
-    'units', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'pnl'
+    'units', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'pnl',
+    'entry_order_id', 'entry_fill_price',
 ]
 
 
@@ -29,7 +30,7 @@ class PositionManager:
                 # 文字／時間欄固定讀成 object：pandas 3 會把全空欄推成 float64、把有值的推成 str，
                 # 之後寫入 exit_reason / exit_timestamp 會丟 TypeError（重啟後無法平倉）
                 df = pd.read_csv(self.csv_path, dtype={c: object for c in (
-                    'symbol', 'status', 'entry_timestamp', 'exit_timestamp', 'exit_reason')})
+                    'symbol', 'status', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'entry_order_id')})
                 for col in POSITION_COLUMNS:
                     if col not in df.columns:
                         df[col] = None
@@ -230,29 +231,47 @@ class PositionManager:
         stop = price * (1 - disaster_stop_pct)
         row = {'symbol': symbol, 'status': 'OPEN', 'entry_price': price, 'stop_loss': stop,
                'take_profit': float('nan'), 'units': units, 'entry_timestamp': timestamp,
-               'exit_timestamp': pd.NaT, 'exit_reason': None, 'pnl': -self._opening_fee(price, units)}
+               'exit_timestamp': pd.NaT, 'exit_reason': None, 'pnl': -self._opening_fee(price, units),
+               'entry_order_id': None, 'entry_fill_price': float('nan')}
         self.positions_df = pd.concat([self.positions_df, pd.DataFrame([row])], ignore_index=True)
         self._save_positions()
-        orders = None
+        idx = self.positions_df.index[-1]
+        info, orders = {"exchange": "disabled", "order_id": None, "fill_price": None}, None
         if self.order_execution_service:
+            entry = None
             try:
                 self.order_execution_service.ensure_cross_margin(symbol)
                 entry = self.order_execution_service.place_market_order(symbol, 'BUY', units)
-                sl = None
-                for _ in range(3 if entry else 0):
+            except Exception as e:
+                logger.error(f"Testnet entry order error for {symbol}: {e}")
+            if not entry:
+                # 交易所沒有這個倉 → 紙上也不留（否則之後的平倉會對一個不存在的部位下單）；下一根若條件仍成立會再試
+                self.positions_df = self.positions_df.drop(index=idx)
+                self._save_positions()
+                self.notification_service.send_heartbeat_notification(
+                    message=f"⚠️ {symbol} 交易所進場失敗，紙上不建倉")
+                return False
+            fill = float(entry.get('avgPrice') or 0) or None
+            info = {"exchange": "filled", "order_id": entry.get('orderId'), "fill_price": fill}
+            self.positions_df.loc[idx, ['entry_order_id', 'entry_fill_price']] = [
+                None if info["order_id"] is None else str(info["order_id"]), fill if fill else float('nan')]
+            self._save_positions()
+            sl = None
+            try:
+                for _ in range(3):
                     sl = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop)
                     if sl:
                         break
-                if entry and not sl:
-                    self.notification_service.send_heartbeat_notification(
-                        message=f"⚠️ {symbol} 已進場但災難止損單掛不上（試 3 次），部位沒有交易所保護，請手動處理")
-                orders = {'entry': entry, 'stop_loss': sl} if entry else None
             except Exception as e:
-                logger.error(f"Testnet order execution error for {symbol}: {e}")
+                logger.error(f"Testnet stop order error for {symbol}: {e}")
+            if not sl:
+                self.notification_service.send_heartbeat_notification(
+                    message=f"⚠️ {symbol} 已進場但災難止損單掛不上（試 3 次），部位沒有交易所保護，請手動處理")
+            orders = {'entry': entry, 'stop_loss': sl}
         self.notification_service.send_trade_notification(
             symbol=symbol, action="BUY", price=price, units=units, stop_loss_price=stop,
             is_volume_on=False, testnet_orders=orders)
-        return True
+        return info
 
     def close_by_signal(self, symbol, price, timestamp, reason="CROSS_10_20") -> bool:
         idx = self.positions_df[(self.positions_df['symbol'] == symbol) & (self.positions_df['status'] == 'OPEN')].index

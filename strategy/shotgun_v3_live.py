@@ -34,6 +34,7 @@ class ShotgunV3Live:
         self.days = {}                       # date -> (frozenset 名單, 是否多頭日)
         self.states = {}                     # symbol -> V.SymbolState
         self.rows_4h = {}                    # 最近一次換日抓到的 4h（影子記錄重用，不再多抓）
+        self.universe = []                   # 最近一次換日的母體（含 4h 沒抓到的幣）
 
     def _universe(self):
         return [s for s in self.fetcher.get_all_symbols()
@@ -61,7 +62,7 @@ class ShotgunV3Live:
             raise RebalanceIncomplete(f"BTC daily bars {len(btc)} < {MIN_BTC_DAYS}")
         bull = V.btc_bull([float(r[4]) for r in btc])
         self.days[cutoff.date()] = (frozenset(top), bull)
-        self.rows_4h = rows_4h
+        self.rows_4h, self.universe = rows_4h, list(universe)
         for d in sorted(self.days)[:-3]:
             del self.days[d]
         logger.info(f"Rebalance {cutoff.date()}: bull={bull} list={top}")
@@ -123,13 +124,16 @@ class ShotgunV3Live:
     @staticmethod
     def _flat(f):
         return dict(**{f"s{h}": f["slope"][h] for h in SL.TFS}, **{f"st{h}": f["status"][h] for h in SL.TFS},
+                    **{f"age{h}": f["age"][h] for h in SL.TFS},
                     ladder=f["ladder"], ladder_complete=f["ladder_complete"], r30=f["r30"],
                     martin_ok=f["martin_ok"], martin_status=f["martin_status"])
 
-    def shadow_snapshot(self, cutoff, top, rows_4h):
-        """換日當下：全母體每個幣一列（RS 名次、是否在 Martin30 名單、各時框斜率與狀態）。只有 4h 也沒抓到的幣不在母體裡。"""
+    def shadow_snapshot(self, cutoff, top, rows_4h, universe=None):
+        """換日當下：全母體每個幣一列（RS 名次、是否在 Martin30 名單、各時框斜率、狀態、資料年齡）。
+        換日時 4h 沒抓到的幣也留一列（4h 以上標 fetch_failed），看得出誰漏掉。"""
         cut_ms = int(cutoff.value // 1_000_000)
-        feats = {sym: SL.features(self._shadow_fetch(sym, "1h", 200), rows4, cut_ms) for sym, rows4 in rows_4h.items()}
+        syms = sorted(set(universe or []) | set(rows_4h))
+        feats = {sym: SL.features(self._shadow_fetch(sym, "1h", 200), rows_4h.get(sym), cut_ms) for sym in syms}
         martin = sorted((s for s, f in feats.items() if f["martin_ok"]), key=lambda s: (-feats[s]["r30"], s))[:20]
         rank = {s: i + 1 for i, s in enumerate(top)}
         return [dict(date=str(cutoff.date()), symbol=s, in_rs=s in rank, rs_rank=rank.get(s), in_martin=s in martin, **self._flat(f))

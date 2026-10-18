@@ -104,6 +104,7 @@ class TestPlaceMarketOrder:
             side='BUY',
             type='MARKET',
             quantity=0.5,
+            newOrderRespType='RESULT',
         )
 
     def test_failure_returns_none(self, service, mock_client):
@@ -181,6 +182,7 @@ class TestClosePosition:
             side='SELL',
             type='MARKET',
             quantity=0.5,
+            newOrderRespType='RESULT',
             reduceOnly='true',
         )
 

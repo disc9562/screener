@@ -83,7 +83,8 @@ class OrderExecutionService:
     def place_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False) -> dict | None:
         """Place a market order on futures testnet. reduce_only=True can never open/flip a position."""
         qty = self._round_quantity(symbol, quantity)
-        params = dict(symbol=symbol, side=side, type='MARKET', quantity=qty)
+        params = dict(symbol=symbol, side=side, type='MARKET', quantity=qty,
+                      newOrderRespType='RESULT')      # 回應帶實際成交均價 avgPrice 與成交量
         if reduce_only:
             params["reduceOnly"] = "true"
         try:

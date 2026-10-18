@@ -81,6 +81,14 @@ def _start_shadow(fn):
     _SHADOW_Q.put(fn)
 
 
+def _drain_shadow(timeout=60):
+    """程式結束前等影子佇列做完（最多 timeout 秒，不讓卡住的工作擋住關機）；回傳是否全部做完。"""
+    deadline = time.time() + timeout
+    while _SHADOW_Q.unfinished_tasks and time.time() < deadline:
+        time.sleep(0.05)
+    return not _SHADOW_Q.unfinished_tasks
+
+
 def _logged_dates(path):
     if not os.path.exists(path):
         return set()
@@ -91,15 +99,18 @@ def _logged_dates(path):
 
 
 def _entry_job(live, symbol, open_ms, ts, close, opened):
-    """進場的影子特徵（背景執行）：price 是訊號收盤，不是實際成交價；paper_opened = 紙上倉是否建立。"""
+    """進場的影子特徵（背景執行）：signal_close 是訊號收盤；exchange／order_id／fill_price 是交易所實際成交（紙上模式為 disabled）。"""
     try:
+        info = opened if isinstance(opened, dict) else {}
         feats = live.entry_features(symbol, open_ms + 3_600_000)
-        append_csv(SHADOW_ENTRIES_CSV, [dict(time=str(ts), symbol=symbol, signal_close=close, paper_opened=bool(opened), **feats)])
+        append_csv(SHADOW_ENTRIES_CSV, [dict(time=str(ts), symbol=symbol, signal_close=close, paper_opened=bool(opened),
+                                             exchange=info.get("exchange"), order_id=info.get("order_id"),
+                                             fill_price=info.get("fill_price"), **feats)])
     except Exception as e:
         logging.error(f"Shadow entry features for {symbol} failed (trading unaffected): {e}")
 
 
-def _shadow_job(live, cutoff, top, rows_4h):
+def _shadow_job(live, cutoff, top, rows_4h, universe=None):
     """背景執行：失敗只記 log，不影響交易；同一天已記過就跳過（換日重試、重啟補記不會重複）。"""
     try:
         if str(cutoff.date()) in _logged_dates(SHADOW_LISTS_CSV):
@@ -109,7 +120,7 @@ def _shadow_job(live, cutoff, top, rows_4h):
         if wait > 0:                                            # 避開換日、暖機的請求尖峰（限速器沒有優先權）
             time.sleep(wait)
         t0 = time.time()
-        rows = live.shadow_snapshot(cutoff, top, rows_4h)
+        rows = live.shadow_snapshot(cutoff, top, rows_4h, universe=universe)
         append_csv(SHADOW_LISTS_CSV, rows)
         logging.info(f"Shadow lists {cutoff.date()}: {len(rows)} rows in {time.time() - t0:.0f}s")
     except Exception as e:
@@ -148,8 +159,8 @@ def bootstrap(live, position_manager, now):
         live.daily_rebalance(today - pd.Timedelta(days=1))
         top, _ = live.daily_rebalance(today)
         symbols |= set(top)
-        rows_4h = dict(live.rows_4h)
-        _start_shadow(lambda: _shadow_job(live, today, list(top), rows_4h))       # 啟動時補記當日快照（已記過會跳過）
+        rows_4h, universe = dict(live.rows_4h), list(live.universe)
+        _start_shadow(lambda: _shadow_job(live, today, list(top), rows_4h, universe))       # 啟動時補記當日快照（已記過會跳過）
     except Exception as e:
         logging.error(f"Startup rebalance failed: {e}", exc_info=True)
         ok = False
@@ -179,8 +190,8 @@ def rollover(live, position_manager, ws, notification_service, cutoff, subscribe
         subscribed |= new
     notification_service.send_list_change_notification(added=set(top), removed=set(), webhook_type="general_targets")
     logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
-    rows_4h = dict(live.rows_4h)
-    _start_shadow(lambda: _shadow_job(live, cutoff, list(top), rows_4h))
+    rows_4h, universe = dict(live.rows_4h), list(live.universe)
+    _start_shadow(lambda: _shadow_job(live, cutoff, list(top), rows_4h, universe))
     return True
 
 
@@ -226,6 +237,8 @@ def run_app(args):
         logging.info("Keyboard interrupt received.")
     finally:
         ws.stop()
+        if not _drain_shadow(60):
+            logging.warning("Shadow jobs left unfinished at shutdown (records only; trading unaffected)")
         logging.info("Application stopped.")
 
 

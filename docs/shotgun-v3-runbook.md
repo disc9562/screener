@@ -34,6 +34,15 @@
   ladder = 最小在哪個時框 ≥ 0.15，比它小的時框只要有一個不是 ok 就記 None 且 ladder_complete=False。
 - `data/shadow_entries.csv`：每筆 Shotgun 進場排背景記錄 time, symbol, signal_close（訊號收盤，不是實際成交價）, paper_opened 與同樣的斜率／狀態欄。
 - 每日多一輪 1h（每幣 200 根，權重 2）；每筆進場多 1h 200＋4h 300（權重 4）。
+- 2026-10-19 補充：shadow_lists 也記換日時 4h 沒抓到的幣（4h 以上標 fetch_failed）；每時框多記 age（最後一根收完距 cutoff 幾小時）。
+  shadow_entries 多記 exchange（filled／disabled）、order_id、fill_price（交易所實際成交均價）。關機時最多等 60 秒把影子佇列做完。
+  **只跑一個 bot 實例**（兩個實例會同時寫同一批 CSV 與倉位檔）。
+
+## 交易端行為（2026-10-19 修正）
+- 交易所進場失敗（下單錯誤或沒有回應）→ **撤掉剛建的紙上倉位**並在 Discord 警示「交易所進場失敗，紙上不建倉」；下一根若條件仍成立會再試。
+  （原本紙上倉會留著，之後平倉會對一個不存在的部位下 reduceOnly 賣單。）
+- 進場成功 → positions CSV 記 entry_order_id、entry_fill_price；市價單改用 newOrderRespType=RESULT 取得實際成交均價。
+- fetcher 遇到網路錯誤（ConnectionError／Timeout）會重試 3 次（原本被 except 吞掉，重試從沒觸發）；用完照舊回傳「沒資料」，不會讓換日整批失敗。
 
 ## 前瞻判定協議（2026-10-19 寫死，看 testnet 結果之前不得修改；三方意見見 core_backtests/docs/slope45_final.md）
 1. 起算：影子記錄修正版上線後第一個完整 UTC 日。固定 **180 天**一次判定，中途不看分組績效、不提前停、不延長。
