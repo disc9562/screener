@@ -92,6 +92,9 @@ NOTIONAL_PCT = float(os.getenv("NOTIONAL_PCT", "0.04"))
 DISASTER_STOP_PCT = float(os.getenv("DISASTER_STOP_PCT", "0.20"))
 EXCLUDE_SYMBOLS = [s for s in os.getenv("EXCLUDE_SYMBOLS", "BTCDOMUSDT").split(",") if s]
 POSITIONS_CSV_V3 = "data/positions_shotgun_v3.csv"
+# 影子記錄（只記錄、不下單）：每日名單＋各時框斜率、每筆進場的斜率
+SHADOW_LISTS_CSV = "data/shadow_lists.csv"
+SHADOW_ENTRIES_CSV = "data/shadow_entries.csv"
 # 代幣化股票／商品（同研究 portfolio_backtest.EQUITY_LIKE）
 EQUITY_LIKE_BASES = set("""SNDK SKHYNIX SOXL XAU XAG MU KORU DKNG UBER DIS TTWO SONY
 AAPL TSLA NVDA MSFT AMZN GOOGL META NFLX AMD INTC COIN MSTR HOOD PLTR SPY QQQ IWM

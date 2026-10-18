@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pandas as pd
 
+from strategy import shadow_lists as SL
 from strategy import shotgun_v3 as V
 
 logger = logging.getLogger(__name__)
@@ -24,13 +25,15 @@ def _closed(rows, now_ms):
 
 
 class ShotgunV3Live:
-    def __init__(self, fetcher, exclude_symbols=(), exclude_bases=(), now_ms=None):
+    def __init__(self, fetcher, exclude_symbols=(), exclude_bases=(), now_ms=None, shadow_fetcher=None):
         self.fetcher = fetcher
+        self.shadow_fetcher = shadow_fetcher or fetcher   # 影子記錄在背景執行緒，用獨立 client（限速額度仍共用）
         self.exclude_symbols = set(exclude_symbols)
         self.exclude_bases = set(exclude_bases)
         self.now_ms = now_ms or (lambda: int(time.time() * 1000))
         self.days = {}                       # date -> (frozenset 名單, 是否多頭日)
         self.states = {}                     # symbol -> V.SymbolState
+        self.rows_4h = {}                    # 最近一次換日抓到的 4h（影子記錄重用，不再多抓）
 
     def _universe(self):
         return [s for s in self.fetcher.get_all_symbols()
@@ -39,13 +42,14 @@ class ShotgunV3Live:
     def daily_rebalance(self, cutoff):
         cut_ms = int(cutoff.value // 1_000_000)
         universe = self._universe()
-        scores, fetched = {}, 0
+        scores, fetched, rows_4h = {}, 0, {}
         for sym in universe:
             raw = self.fetcher.fetch_klines(sym, "4h", 300)
             if raw:
                 fetched += 1
             rows = [r for r in (raw or []) if int(r[0]) < cut_ms]
             if rows:
+                rows_4h[sym] = rows
                 sc = V.rs_score(np.array([float(r[4]) for r in rows]), len(rows) - 1)
                 if sc is not None:
                     scores[sym] = sc
@@ -57,6 +61,7 @@ class ShotgunV3Live:
             raise RebalanceIncomplete(f"BTC daily bars {len(btc)} < {MIN_BTC_DAYS}")
         bull = V.btc_bull([float(r[4]) for r in btc])
         self.days[cutoff.date()] = (frozenset(top), bull)
+        self.rows_4h = rows_4h
         for d in sorted(self.days)[:-3]:
             del self.days[d]
         logger.info(f"Rebalance {cutoff.date()}: bull={bull} list={top}")
@@ -105,3 +110,32 @@ class ShotgunV3Live:
         if symbol in lst and bull and V.entry_signal(snap.close, snap.s10, snap.s20, snap.s50, snap.s233, snap.er):
             return "BUY"
         return None
+
+    # ---------- 影子記錄（只記錄、不影響交易；定義見 strategy/shadow_lists.py） ----------
+    def _shadow_fetch(self, symbol, interval, limit):
+        """抓取失敗回 None（記成 fetch_failed），不讓單一幣的錯誤中斷整批。"""
+        try:
+            return self.shadow_fetcher.fetch_klines(symbol, interval, limit)
+        except Exception as e:
+            logger.warning(f"shadow fetch {symbol} {interval} failed: {e}")
+            return None
+
+    @staticmethod
+    def _flat(f):
+        return dict(**{f"s{h}": f["slope"][h] for h in SL.TFS}, **{f"st{h}": f["status"][h] for h in SL.TFS},
+                    ladder=f["ladder"], ladder_complete=f["ladder_complete"], r30=f["r30"],
+                    martin_ok=f["martin_ok"], martin_status=f["martin_status"])
+
+    def shadow_snapshot(self, cutoff, top, rows_4h):
+        """換日當下：全母體每個幣一列（RS 名次、是否在 Martin30 名單、各時框斜率與狀態）。只有 4h 也沒抓到的幣不在母體裡。"""
+        cut_ms = int(cutoff.value // 1_000_000)
+        feats = {sym: SL.features(self._shadow_fetch(sym, "1h", 200), rows4, cut_ms) for sym, rows4 in rows_4h.items()}
+        martin = sorted((s for s, f in feats.items() if f["martin_ok"]), key=lambda s: (-feats[s]["r30"], s))[:20]
+        rank = {s: i + 1 for i, s in enumerate(top)}
+        return [dict(date=str(cutoff.date()), symbol=s, in_rs=s in rank, rs_rank=rank.get(s), in_martin=s in martin, **self._flat(f))
+                for s, f in sorted(feats.items())]
+
+    def entry_features(self, symbol, now_ms):
+        """進場當下（訊號根收盤）各時框 EMA20 斜率與狀態；4h 抓 300 根，與每日快照的歷史長度一致。"""
+        f = SL.features(self._shadow_fetch(symbol, "1h", 200), self._shadow_fetch(symbol, "4h", 300), now_ms)
+        return self._flat(f)

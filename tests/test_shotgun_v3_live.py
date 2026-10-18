@@ -127,3 +127,40 @@ def test_daily_rebalance_refuses_incomplete_data():
 
     with pytest.raises(RebalanceIncomplete):
         _live(ShortBtc()).daily_rebalance(pd.Timestamp(T0, unit="ms"))
+
+
+def test_shadow_snapshot_logs_rs_martin_and_slopes():
+    f = FakeFetcher()
+    for s in ("AAAUSDT", "BBBUSDT", "BTCUSDT"):
+        f.k1h[s] = _rows(100 * np.exp(np.cumsum(np.full(200, 0.002 if s == "AAAUSDT" else 0.0))), T0 - 200 * H, H)
+    live = _live(f)
+    cut = pd.Timestamp(T0, unit="ms")
+    top, _ = live.daily_rebalance(cut)
+    rows = live.shadow_snapshot(cut, top, dict(live.rows_4h))
+    by = {r["symbol"]: r for r in rows}
+    a = by["AAAUSDT"]
+    assert a["in_rs"] and a["rs_rank"] == 1 and a["in_martin"]           # 4h 每根 +0.2% → 30 天約 +43%
+    assert all(k in a for k in ("date", "s1", "s2", "s4", "s8", "s12", "s24", "r30", "ladder"))
+    assert ("AAAUSDT", "1h", 200) in f.calls
+
+
+def test_entry_features_fetches_and_computes_all_timeframes():
+    f = FakeFetcher()
+    f.k1h["AAAUSDT"] = _rows(100 * np.exp(np.cumsum(np.full(200, 0.002))), T0 - 200 * H, H)
+    feats = _live(f).entry_features("AAAUSDT", T0)
+    assert {"s1", "s2", "s4", "s8", "s12", "s24", "ladder", "r30", "martin_ok"} <= set(feats)
+    assert ("AAAUSDT", "4h", 300) in f.calls and ("AAAUSDT", "1h", 200) in f.calls
+
+
+def test_shadow_logs_full_universe_with_separate_fetcher():
+    f, shadow = FakeFetcher(), FakeFetcher()
+    for s in ("AAAUSDT", "BBBUSDT"):
+        shadow.k1h[s] = _rows(100 * np.exp(np.cumsum(np.full(200, 0.002 if s == "AAAUSDT" else 0.0))), T0 - 200 * H, H)
+    shadow.k1h["BTCUSDT"] = None                                   # 1h 抓取失敗也要留一列、標狀態
+    live = ShotgunV3Live(f, exclude_symbols=["BTCDOMUSDT"], exclude_bases={"TSLA"}, now_ms=lambda: T0, shadow_fetcher=shadow)
+    cut = pd.Timestamp(T0, unit="ms")
+    top, _ = live.daily_rebalance(cut)
+    rows = {r["symbol"]: r for r in live.shadow_snapshot(cut, top, dict(live.rows_4h))}
+    assert set(rows) == set(live.rows_4h)                          # 全母體，不只記名單上的
+    assert rows["BTCUSDT"]["st1"] == "fetch_failed" and rows["BTCUSDT"]["ladder_complete"] is False
+    assert not any(c[1] == "1h" for c in f.calls)                  # 影子的 1h 抓取不走交易用的 fetcher

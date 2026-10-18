@@ -4,6 +4,7 @@ import time
 import logging
 import queue
 import argparse
+import threading
 from datetime import datetime
 
 import pandas as pd
@@ -14,6 +15,7 @@ from config import (
     get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET,
     USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET,
     NOTIONAL_PCT, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, EQUITY_LIKE_BASES, POSITIONS_CSV_V3,
+    SHADOW_LISTS_CSV, SHADOW_ENTRIES_CSV,
 )
 from data.fetcher import CryptoFetcher
 from strategy.shotgun_v3_live import ShotgunV3Live
@@ -46,6 +48,74 @@ def _init_order_execution_service():
         return None
 
 
+def append_csv(path, rows):
+    """影子記錄：累加寫入 CSV（只有第一次寫表頭）。"""
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    pd.DataFrame(rows).to_csv(path, mode="a", header=not os.path.exists(path), index=False, encoding="utf-8")
+
+
+SHADOW_DELAY = pd.Timedelta(minutes=10)   # 每日快照在換日後 10 分鐘才開始抓（約 2N 權重）
+_SHADOW_Q = queue.Queue()
+_SHADOW_WORKER = None
+
+
+def _shadow_worker():
+    while True:
+        fn = _SHADOW_Q.get()
+        try:
+            fn()
+        except Exception as e:
+            logging.error(f"Shadow job crashed (trading unaffected): {e}", exc_info=True)
+        finally:
+            _SHADOW_Q.task_done()
+
+
+def _start_shadow(fn):
+    """影子工作排進單一背景佇列：主迴圈不等它、只有一個寫入者。程式結束時佇列裡沒做完的會丟掉（只是記錄）。"""
+    global _SHADOW_WORKER
+    if _SHADOW_WORKER is None or not _SHADOW_WORKER.is_alive():
+        _SHADOW_WORKER = threading.Thread(target=_shadow_worker, daemon=True, name="shadow")
+        _SHADOW_WORKER.start()
+    _SHADOW_Q.put(fn)
+
+
+def _logged_dates(path):
+    if not os.path.exists(path):
+        return set()
+    try:
+        return set(pd.read_csv(path, usecols=["date"])["date"].astype(str))
+    except Exception:
+        return set()
+
+
+def _entry_job(live, symbol, open_ms, ts, close, opened):
+    """進場的影子特徵（背景執行）：price 是訊號收盤，不是實際成交價；paper_opened = 紙上倉是否建立。"""
+    try:
+        feats = live.entry_features(symbol, open_ms + 3_600_000)
+        append_csv(SHADOW_ENTRIES_CSV, [dict(time=str(ts), symbol=symbol, signal_close=close, paper_opened=bool(opened), **feats)])
+    except Exception as e:
+        logging.error(f"Shadow entry features for {symbol} failed (trading unaffected): {e}")
+
+
+def _shadow_job(live, cutoff, top, rows_4h):
+    """背景執行：失敗只記 log，不影響交易；同一天已記過就跳過（換日重試、重啟補記不會重複）。"""
+    try:
+        if str(cutoff.date()) in _logged_dates(SHADOW_LISTS_CSV):
+            logging.info(f"Shadow lists {cutoff.date()} already logged, skip")
+            return
+        wait = (cutoff + SHADOW_DELAY - pd.Timestamp.now(tz="UTC").tz_localize(None)).total_seconds()
+        if wait > 0:                                            # 避開換日、暖機的請求尖峰（限速器沒有優先權）
+            time.sleep(wait)
+        t0 = time.time()
+        rows = live.shadow_snapshot(cutoff, top, rows_4h)
+        append_csv(SHADOW_LISTS_CSV, rows)
+        logging.info(f"Shadow lists {cutoff.date()}: {len(rows)} rows in {time.time() - t0:.0f}s")
+    except Exception as e:
+        logging.error(f"Shadow snapshot {cutoff.date()} failed (trading unaffected): {e}", exc_info=True)
+
+
 def next_cutoff(now: pd.Timestamp) -> pd.Timestamp:
     return now.normalize() + pd.Timedelta(days=1)
 
@@ -63,7 +133,8 @@ def handle_kline(message, live, position_manager, cfg):
     if action == "SELL":
         position_manager.close_by_signal(symbol, close, ts, "CROSS_10_20")
     elif action == "BUY":
-        position_manager.open_notional(symbol, close, ts, cfg["NOTIONAL_PCT"], cfg["DISASTER_STOP_PCT"])
+        opened = position_manager.open_notional(symbol, close, ts, cfg["NOTIONAL_PCT"], cfg["DISASTER_STOP_PCT"])
+        _start_shadow(lambda: _entry_job(live, symbol, open_ms, ts, close, opened))   # 影子記錄排背景，不拖主迴圈
     return action
 
 
@@ -77,6 +148,8 @@ def bootstrap(live, position_manager, now):
         live.daily_rebalance(today - pd.Timedelta(days=1))
         top, _ = live.daily_rebalance(today)
         symbols |= set(top)
+        rows_4h = dict(live.rows_4h)
+        _start_shadow(lambda: _shadow_job(live, today, list(top), rows_4h))       # 啟動時補記當日快照（已記過會跳過）
     except Exception as e:
         logging.error(f"Startup rebalance failed: {e}", exc_info=True)
         ok = False
@@ -106,6 +179,8 @@ def rollover(live, position_manager, ws, notification_service, cutoff, subscribe
         subscribed |= new
     notification_service.send_list_change_notification(added=set(top), removed=set(), webhook_type="general_targets")
     logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
+    rows_4h = dict(live.rows_4h)
+    _start_shadow(lambda: _shadow_job(live, cutoff, list(top), rows_4h))
     return True
 
 
@@ -124,7 +199,8 @@ def run_app(args):
     cfg = {"NOTIONAL_PCT": NOTIONAL_PCT, "DISASTER_STOP_PCT": DISASTER_STOP_PCT}
     position_manager = PositionManager(notification_service, strategy_config, POSITIONS_CSV_V3,
                                        order_execution_service=_init_order_execution_service())
-    live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES)
+    live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES,
+                         shadow_fetcher=CryptoFetcher())
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
     subscribed, ok = bootstrap(live, position_manager, now)
     cutoff = next_cutoff(now) if ok else now.normalize()      # 今日名單沒算成 → 進迴圈後立刻重試
