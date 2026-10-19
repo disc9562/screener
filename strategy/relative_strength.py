@@ -47,25 +47,15 @@ class RelativeStrengthStrategy(Strategy):
         if df.empty:
             return {"signal": "INSUFFICIENT_DATA_AFTER_SMA_DROP"}
 
-        rs_score = 0.0
-        # The original loop starts from 1 to bars+1
-        # df.values[-i] means the i-th element from the end
-        # So, df.iloc[-i] is equivalent
-        for i in range(1, bars + 1):
-            current_close = df['Close'].iloc[-i]
-            moving_average_30 = df['SMA_30'].iloc[-i]
-            moving_average_45 = df['SMA_45'].iloc[-i]
-            moving_average_60 = df['SMA_60'].iloc[-i]
-            
-            # Formula from crypto_relative_strength.py
-            weight = (((current_close - moving_average_30) +
-                       (current_close - moving_average_45) +
-                       (current_close - moving_average_60)) *
-                      (((bars - i) * days / bars) + 1) +
-                      (moving_average_30 - moving_average_45) +
-                      (moving_average_30 - moving_average_60) +
-                      (moving_average_45 - moving_average_60)) / moving_average_60
-            rs_score += weight * (bars - i)
+        c = df['Close'].to_numpy(dtype=float)[-bars:]
+        a30 = df['SMA_30'].to_numpy(dtype=float)[-bars:]
+        a45 = df['SMA_45'].to_numpy(dtype=float)[-bars:]
+        a60 = df['SMA_60'].to_numpy(dtype=float)[-bars:]
+        import numpy as np
+        j = np.arange(bars, dtype=float)
+        weight = (((c - a30) + (c - a45) + (c - a60)) * (((j * days) / bars) + 1)
+                  + (a30 - a45) + (a30 - a60) + (a45 - a60)) / a60
+        rs_score = float(np.sum(weight * j))
 
         return {"signal": "RS_SCORE", "score": rs_score}
 

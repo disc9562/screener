@@ -87,4 +87,22 @@ def get_strategy_config():
         "TEST_COIN_SUBSET": TEST_COIN_SUBSET,
     }
 
+# --- Shotgun v3（docs/shotgun-v3-bot-spec.md）---
+NOTIONAL_PCT = float(os.getenv("NOTIONAL_PCT", "0.04"))
+DISASTER_STOP_PCT = float(os.getenv("DISASTER_STOP_PCT", "0.20"))
+RS_MODE = os.getenv("RS_MODE", "v2")
+MIN_DAILY_QUOTE_VOL = float(os.getenv("MIN_DAILY_QUOTE_VOL", "10000000"))
+EXCLUDE_SYMBOLS = [s for s in os.getenv("EXCLUDE_SYMBOLS", "BTCDOMUSDT").split(",") if s]
+POSITIONS_CSV_V3 = "data/positions_shotgun_v3.csv"
+# 影子記錄（只記錄、不下單）：每日名單＋各時框斜率、每筆進場的斜率
+SHADOW_LISTS_CSV = "data/shadow_lists.csv"
+SHADOW_ENTRIES_CSV = "data/shadow_entries.csv"
+# 代幣化股票／商品／穩定幣（同研究 portfolio_backtest.EQUITY_LIKE + 穩定幣對）
+EQUITY_LIKE_BASES = set("""SNDK SKHYNIX SOXL XAU XAG MU KORU DKNG UBER DIS TTWO SONY
+AAPL TSLA NVDA MSFT AMZN GOOGL META NFLX AMD INTC COIN MSTR HOOD PLTR SPY QQQ IWM
+GLD SLV TQQQ SOXX ARKK BABA NIO PYPL SQ SHOP ABNB RIVN LCID F GM BA JPM GS V MA
+WMT COST PEP KO MCD NKE SBUX CRM ORCL ADBE AVGO QCOM TXN ASML TSM ARM SMCI DELL
+HPQ IBM CSCO T VZ XOM CVX OXY PFE JNJ UNH LLY MRNA ABBV TMO DHR CAT DE MMM GE HON
+UPS FDX LMT RTX NOC USDC FDUSD TUSD USDP DAI USDE BUSD EUR AEUR""".split())
+
 print("Configuration loaded.")

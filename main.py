@@ -2,8 +2,10 @@ import os
 import sys
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import queue
 import argparse
+import threading
 from datetime import datetime
 
 import pandas as pd
@@ -13,42 +15,21 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 from config import (
     get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET,
     USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET,
+    NOTIONAL_PCT, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, EQUITY_LIKE_BASES, POSITIONS_CSV_V3,
+    SHADOW_LISTS_CSV, SHADOW_ENTRIES_CSV, RS_MODE, MIN_DAILY_QUOTE_VOL,
 )
-from data.transformer import transform_crypto_data
 from data.fetcher import CryptoFetcher
-from strategy.strong_target_screener import StrongTargetScreener
-from strategy.alligator_strategy import AlligatorStrategy
+from strategy.shotgun_v3_live import ShotgunV3Live
 from services.position_manager import PositionManager
 from services.websocket_manager import WebSocketManager
 from services.notification_service import NotificationService
 from services.order_execution_service import OrderExecutionService
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='application.log', filemode='w')
-
-
-def process_kline_message(symbol: str, kline: dict, position_manager: PositionManager,
-                          alligator_strategy: AlligatorStrategy, strong_targets: set,
-                          is_volume_on: bool):
-    """Processes a single kline for a given strategy in a stateful manner."""
-    try:
-        latest_price = pd.Series({
-            'Datetime': pd.to_datetime(kline['t'], unit='ms'),
-            'High': float(kline['h']),
-            'Low': float(kline['l']),
-            'Close': float(kline['c']),
-        })
-        position_manager.update_positions({symbol: latest_price})
-
-        if symbol not in strong_targets:
-            return
-
-        signal = alligator_strategy.run_with_kline(symbol, kline)
-        if signal and symbol not in position_manager.get_open_positions_symbols():
-            logging.info(f"SIGNALS FOUND for {symbol} (Volume ON: {is_volume_on}): {signal}")
-            position_manager.open_position(symbol, signal)
-
-    except Exception as e:
-        logging.error(f"Error in process_kline_message for {symbol}: {e}", exc_info=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[RotatingFileHandler('application.log', maxBytes=20 * 1024 * 1024, backupCount=5, encoding='utf-8')],
+)
 
 
 def _init_order_execution_service():
@@ -60,162 +41,220 @@ def _init_order_execution_service():
         logging.warning("USE_TESTNET is enabled but BINANCE_TESTNET_API_KEY/SECRET not set. Running without order execution.")
         return None
     try:
-        return OrderExecutionService(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET)
+        service = OrderExecutionService(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET)
+        if not service.is_one_way_mode():
+            logging.error("Account is in hedge (dual-side) position mode: reduceOnly orders would fail. "
+                          "Switch to one-way mode. Order execution DISABLED.")
+            return None
+        return service
     except Exception as e:
         logging.error(f"Failed to initialize OrderExecutionService: {e}")
         logging.warning("Continuing without testnet order execution.")
         return None
 
 
-def run_app(args):
-    logging.info("Application starting...")
+def append_csv(path, rows):
+    """影子記錄：累加寫入 CSV（只有第一次寫表頭）。"""
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    pd.DataFrame(rows).to_csv(path, mode="a", header=not os.path.exists(path), index=False, encoding="utf-8")
 
+
+SHADOW_DELAY = pd.Timedelta(minutes=10)   # 每日快照在換日後 10 分鐘才開始抓（約 2N 權重）
+_SHADOW_Q = queue.Queue()
+_SHADOW_WORKER = None
+
+
+def _shadow_worker():
+    while True:
+        fn = _SHADOW_Q.get()
+        try:
+            fn()
+        except Exception as e:
+            logging.error(f"Shadow job crashed (trading unaffected): {e}", exc_info=True)
+        finally:
+            _SHADOW_Q.task_done()
+
+
+def _start_shadow(fn):
+    """影子工作排進單一背景佇列：主迴圈不等它、只有一個寫入者。程式結束時佇列裡沒做完的會丟掉（只是記錄）。"""
+    global _SHADOW_WORKER
+    if _SHADOW_WORKER is None or not _SHADOW_WORKER.is_alive():
+        _SHADOW_WORKER = threading.Thread(target=_shadow_worker, daemon=True, name="shadow")
+        _SHADOW_WORKER.start()
+    _SHADOW_Q.put(fn)
+
+
+def _drain_shadow(timeout=60):
+    """程式結束前等影子佇列做完（最多 timeout 秒，不讓卡住的工作擋住關機）；回傳是否全部做完。"""
+    deadline = time.time() + timeout
+    while _SHADOW_Q.unfinished_tasks and time.time() < deadline:
+        time.sleep(0.05)
+    return not _SHADOW_Q.unfinished_tasks
+
+
+def _logged_dates(path):
+    if not os.path.exists(path):
+        return set()
+    try:
+        return set(pd.read_csv(path, usecols=["date"])["date"].astype(str))
+    except Exception:
+        return set()
+
+
+def _entry_job(live, symbol, open_ms, ts, close, opened):
+    """進場的影子特徵（背景執行）：signal_close 是訊號收盤；exchange／order_id／fill_price 是交易所實際成交（紙上模式為 disabled）。"""
+    try:
+        info = opened if isinstance(opened, dict) else {}
+        feats = live.entry_features(symbol, open_ms + 3_600_000)
+        append_csv(SHADOW_ENTRIES_CSV, [dict(time=str(ts), symbol=symbol, signal_close=close, paper_opened=bool(opened),
+                                             exchange=info.get("exchange"), order_id=info.get("order_id"),
+                                             fill_price=info.get("fill_price"), **feats)])
+    except Exception as e:
+        logging.error(f"Shadow entry features for {symbol} failed (trading unaffected): {e}")
+
+
+def _shadow_job(live, cutoff, top, rows_4h, universe=None):
+    """背景執行：失敗只記 log，不影響交易；同一天已記過就跳過（換日重試、重啟補記不會重複）。"""
+    try:
+        if str(cutoff.date()) in _logged_dates(SHADOW_LISTS_CSV):
+            logging.info(f"Shadow lists {cutoff.date()} already logged, skip")
+            return
+        wait = (cutoff + SHADOW_DELAY - pd.Timestamp.now(tz="UTC").tz_localize(None)).total_seconds()
+        if wait > 0:                                            # 避開換日、暖機的請求尖峰（限速器沒有優先權）
+            time.sleep(wait)
+        t0 = time.time()
+        rows = live.shadow_snapshot(cutoff, top, rows_4h, universe=universe)
+        append_csv(SHADOW_LISTS_CSV, rows)
+        logging.info(f"Shadow lists {cutoff.date()}: {len(rows)} rows in {time.time() - t0:.0f}s")
+    except Exception as e:
+        logging.error(f"Shadow snapshot {cutoff.date()} failed (trading unaffected): {e}", exc_info=True)
+
+
+def next_cutoff(now: pd.Timestamp) -> pd.Timestamp:
+    return now.normalize() + pd.Timedelta(days=1)
+
+
+def handle_kline(message, live, position_manager, cfg):
+    """收完的 1h K 棒：先用低點檢查紙上災難止損，再交給策略判斷 BUY/SELL。"""
+    k, symbol = message['k'], message['s']
+    open_ms, close = int(k['t']), float(k['c'])
+    ts = pd.to_datetime(open_ms, unit='ms') + pd.Timedelta(hours=1)
+    if symbol in position_manager.get_open_positions_symbols():
+        position_manager.update_positions({symbol: pd.Series({
+            'Datetime': ts, 'High': float(k['h']), 'Low': float(k['l']), 'Close': close})})
+    has_position = symbol in position_manager.get_open_positions_symbols()
+    action = live.on_closed_kline(symbol, open_ms, close, has_position)
+    if action == "SELL":
+        position_manager.close_by_signal(symbol, close, ts, "CROSS_10_20")
+    elif action == "BUY":
+        opened = position_manager.open_notional(symbol, close, ts, cfg["NOTIONAL_PCT"], cfg["DISASTER_STOP_PCT"])
+        _start_shadow(lambda: _entry_job(live, symbol, open_ms, ts, close, opened))   # 影子記錄排背景，不拖主迴圈
+    return action
+
+
+def bootstrap(live, position_manager, now):
+    """啟動：算今天（以及前一天，給 23:00 那根用）的名單與開關，暖機名單 ∪ 持倉。
+    回傳 (要訂閱的幣, 今日名單是否算成)；算不成時仍暖機持倉，讓出場照常運作。"""
+    today = now.normalize()
+    symbols = set(position_manager.get_open_positions_symbols())
+    ok = True
+    try:
+        live.daily_rebalance(today - pd.Timedelta(days=1))
+        top, _ = live.daily_rebalance(today)
+        symbols |= set(top)
+        rows_4h, universe = dict(live.rows_4h), list(live.universe)
+        _start_shadow(lambda: _shadow_job(live, today, list(top), rows_4h, universe))       # 啟動時補記當日快照（已記過會跳過）
+    except Exception as e:
+        logging.error(f"Startup rebalance failed: {e}", exc_info=True)
+        ok = False
+    for s in symbols:
+        live.warmup(s)
+    return symbols, ok
+
+
+REBALANCE_RETRY = pd.Timedelta(minutes=5)
+
+
+def rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
+    """換日：算 cutoff 當日的名單與開關。失敗 → 警示並回傳 False（呼叫端不推進 cutoff，5 分鐘後重試；
+    期間當日名單為空 → 不進新倉，但持倉的出場照常）。成功 → 暖機「名單 ∪ 持倉」中沒有狀態的幣、訂閱新幣。"""
+    try:
+        top, bull = live.daily_rebalance(cutoff)
+    except Exception as e:
+        logging.error(f"Daily rebalance {cutoff.date()} failed: {e}", exc_info=True)
+        notification_service.send_heartbeat_notification(
+            message=f"⚠️ {cutoff.date()} 名單計算失敗，5 分鐘後重試：{e}")
+        return False
+    active = set(top) | set(position_manager.get_open_positions_symbols())
+    for s in active - set(live.states):
+        live.warmup(s)
+    new = set(top) - subscribed
+    if new:
+        ws.subscribe(sorted(new))
+        subscribed |= new
+    stale = subscribed - active
+    if stale:
+        if hasattr(ws, "unsubscribe"):
+            ws.unsubscribe(sorted(stale))
+        subscribed -= stale
+        if isinstance(live.states, dict):
+            for s in stale:
+                live.states.pop(s, None)
+    notification_service.send_list_change_notification(added=set(top), removed=stale, webhook_type="general_targets")
+    logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
+    rows_4h, universe = dict(live.rows_4h), list(live.universe)
+    _start_shadow(lambda: _shadow_job(live, cutoff, list(top), rows_4h, universe))
+    return True
+
+
+def run_app(args):
+    logging.info("Shotgun v3 starting...")
     strategy_config = get_strategy_config()
     webhook_on = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_ON")
     webhook_off = strategy_config.get("DISCORD_WEBHOOK_URL_VOLUME_OFF")
     if not webhook_on or not webhook_off:
         logging.error("Error: Both DISCORD_WEBHOOK_URL_VOLUME_ON and DISCORD_WEBHOOK_URL_VOLUME_OFF must be configured.")
         sys.exit(1)
-
     notification_service = NotificationService(webhook_urls_map={
-        "volume_on": webhook_on,
-        "volume_off": webhook_off,
+        "volume_on": webhook_on, "volume_off": webhook_off,
         "general_targets": strategy_config.get("DISCORD_WEBHOOK_URL_GENERAL_TARGETS"),
     })
-
-    order_execution_service = _init_order_execution_service()
-
-    # Instantiate two strategy/position manager pairs
-    strategy_config_volume_on = {**strategy_config, "use_volume_condition": True}
-    position_manager_volume_on = PositionManager(notification_service, strategy_config_volume_on, 'data/positions_volume_on.csv', order_execution_service=order_execution_service)
-    alligator_strategy_volume_on = AlligatorStrategy(strategy_config_volume_on)
-
-    strategy_config_volume_off = {**strategy_config, "use_volume_condition": False}
-    position_manager_volume_off = PositionManager(notification_service, strategy_config_volume_off, 'data/positions_volume_off.csv', order_execution_service=order_execution_service)
-    alligator_strategy_volume_off = AlligatorStrategy(strategy_config_volume_off)
-
-    strategy_pairs = {
-        "volume_on": {"position_manager": position_manager_volume_on, "alligator_strategy": alligator_strategy_volume_on, "strong_targets": set(), "is_volume_on": True},
-        "volume_off": {"position_manager": position_manager_volume_off, "alligator_strategy": alligator_strategy_volume_off, "strong_targets": set(), "is_volume_on": False}
-    }
-    
-    screener = StrongTargetScreener({**strategy_config, 'local_test_mode': getattr(args, 'local_test', False)})
-
-    # Fetch initial strong targets
-    logging.info("Performing initial screening for strong targets...")
-    strong_targets_with_scores = screener.run_screener()
-    top_20_targets = {item[0] for item in strong_targets_with_scores}
-
-    logging.info("Starting warmup phase for strategies...")
-    crypto_fetcher = CryptoFetcher()
-    for symbol in top_20_targets:
-        try:
-            historical_klines = crypto_fetcher.fetch_klines(symbol, '15m', limit=250)
-            if not historical_klines:
-                logging.warning(f"No historical k-lines found for {symbol} during warmup.")
-                continue
-            historical_df = transform_crypto_data(historical_klines)
-            if historical_df.empty:
-                logging.warning(f"Could not generate DataFrame for {symbol} during warmup.")
-                continue
-            for pair in strategy_pairs.values():
-                pair["alligator_strategy"].warmup(symbol, historical_df)
-        except Exception as e:
-            logging.error(f"Failed to fetch/warmup for {symbol}: {e}", exc_info=True)
-
-    # Assign targets and notify
-    for pair in strategy_pairs.values():
-        pair["strong_targets"] = top_20_targets
-        notification_service.send_list_change_notification(added=top_20_targets, removed=set(), is_volume_on=pair["is_volume_on"], is_local_test=getattr(args, 'local_test', False))
-    notification_service.send_list_change_notification(added=top_20_targets, removed=set(), webhook_type="general_targets", is_local_test=getattr(args, 'local_test', False))
-
-    open_symbols_on = set(position_manager_volume_on.get_open_positions_symbols())
-    open_symbols_off = set(position_manager_volume_off.get_open_positions_symbols())
-    symbols_to_subscribe = list(top_20_targets | open_symbols_on | open_symbols_off)
-
-    if getattr(args, 'local_test', False):
-        logging.warning("Local test mode is not supported with the new stateful architecture. Exiting.")
-        return
-
-    ws_manager = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
-    ws_manager.start(symbols=symbols_to_subscribe, interval='15m')
-
-    logging.info("Entering main processing loop...")
-    last_heartbeat_minute = -1
-    fetched_times_today = set()
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
+    cfg = {"NOTIONAL_PCT": NOTIONAL_PCT, "DISASTER_STOP_PCT": DISASTER_STOP_PCT}
+    position_manager = PositionManager(notification_service, strategy_config, POSITIONS_CSV_V3,
+                                       order_execution_service=_init_order_execution_service())
+    live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES,
+                         shadow_fetcher=CryptoFetcher(), rs_mode=RS_MODE, min_daily_quote_vol=MIN_DAILY_QUOTE_VOL)
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    subscribed, ok = bootstrap(live, position_manager, now)
+    cutoff = next_cutoff(now) if ok else now.normalize()      # 今日名單沒算成 → 進迴圈後立刻重試
+    retry_at = now
+    notification_service.send_list_change_notification(added=set(subscribed), removed=set(), webhook_type="general_targets")
+    ws = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
+    ws.start(symbols=sorted(subscribed), interval='1h')
     try:
         while True:
-            now = datetime.now()
-            # Reset fetched times at the start of a new day
-            current_day_str = now.strftime("%Y-%m-%d")
-            if current_day_str != today_str:
-                fetched_times_today = set()
-                today_str = current_day_str
-                logging.info("New day, resetting scheduled fetch times.")
-
-            # Scheduled re-screening logic
-            for fetch_time_str in strategy_config.get("TARGET_FETCH_TIMES", []):
-                fetch_hour, fetch_minute = map(int, fetch_time_str.split(':'))
-                if now.hour == fetch_hour and now.minute == fetch_minute and (today_str, fetch_time_str) not in fetched_times_today:
-                    logging.info(f"Scheduled re-running screener for {fetch_time_str}...")
-                    strong_targets_with_scores = screener.run_screener()
-                    new_top_20_targets = {item[0] for item in strong_targets_with_scores}
-
-                    for pair in strategy_pairs.values():
-                        current_symbols = pair["strong_targets"]
-                        added = new_top_20_targets - current_symbols
-                        removed = current_symbols - new_top_20_targets
-                        
-                        if added:
-                            logging.info(f"New symbols to subscribe to for strategy: {added}")
-                            ws_manager.subscribe(list(added))
-                        
-                        if added or removed:
-                            notification_service.send_list_change_notification(
-                                added=added, removed=removed, is_volume_on=pair["is_volume_on"], is_local_test=False
-                            )
-                        pair["strong_targets"] = new_top_20_targets
-
-                    notification_service.send_list_change_notification(
-                        added=new_top_20_targets, removed=set(), webhook_type="general_targets", is_local_test=False
-                    )
-                    
-                    fetched_times_today.add((today_str, fetch_time_str))
-
-            # Heartbeat notification
-            current_minute = now.minute
-            if current_minute % 15 == 0 and current_minute != last_heartbeat_minute:
-                if not position_manager_volume_on.get_open_positions_symbols() and not position_manager_volume_off.get_open_positions_symbols():
-                    logging.info("HEARTBEAT_CHECK: No open positions. Sending notification.")
-                    notification_service.send_heartbeat_notification(message="沒有艙位")
-                last_heartbeat_minute = current_minute
-
-            try:
-                message = ws_manager.get_message(block=False)
-                if message:
-                    kline = message['k']
-                    symbol = message['s']
-                    for pair in strategy_pairs.values():
-                        process_kline_message(
-                            symbol, kline,
-                            pair["position_manager"],
-                            pair["alligator_strategy"],
-                            pair["strong_targets"],
-                            pair["is_volume_on"],
-                        )
-            except queue.Empty:
-                pass
-
-            time.sleep(1)
-
+            now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+            if now >= cutoff and now >= retry_at:
+                if rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
+                    cutoff = next_cutoff(now)
+                else:
+                    retry_at = now + REBALANCE_RETRY
+            message = ws.get_message(block=True, timeout=1)
+            if message:
+                try:
+                    handle_kline(message, live, position_manager, cfg)
+                except Exception as e:
+                    logging.error(f"handle_kline failed for {message.get('s')}: {e}", exc_info=True)
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")
     finally:
-        logging.info("Stopping WebSocket Manager...")
-        ws_manager.stop()
+        ws.stop()
+        if not _drain_shadow(60):
+            logging.warning("Shadow jobs left unfinished at shutdown (records only; trading unaffected)")
         logging.info("Application stopped.")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Crypto Screener Bot")

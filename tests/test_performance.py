@@ -1,6 +1,9 @@
 import subprocess
 import time
+import pytest
 
+
+@pytest.mark.skip(reason="Manual benchmark that calls live Binance API via subprocess")
 def test_legacy_script_performance():
     """Measures the execution time of the original crypto_relative_strength.py script."""
     print("\n--- Running Legacy Performance Benchmark ---")
@@ -22,4 +25,5 @@ def test_legacy_script_performance():
     # We are not asserting anything here, just recording the time.
     # In a more advanced setup, we could fail the test if it exceeds a threshold.
     assert True
+
 

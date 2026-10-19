@@ -104,6 +104,7 @@ class TestPlaceMarketOrder:
             side='BUY',
             type='MARKET',
             quantity=0.5,
+            newOrderRespType='RESULT',
         )
 
     def test_failure_returns_none(self, service, mock_client):
@@ -127,7 +128,7 @@ class TestPlaceStopLossOrder:
             type='STOP_MARKET',
             quantity=0.5,
             stopPrice=60000.0,
-            closePosition='false',
+            reduceOnly='true',
         )
 
     def test_failure_returns_none(self, service, mock_client):
@@ -149,7 +150,7 @@ class TestPlaceTakeProfitOrder:
             type='TAKE_PROFIT_MARKET',
             quantity=0.5,
             stopPrice=80000.0,
-            closePosition='false',
+            reduceOnly='true',
         )
 
 
@@ -175,12 +176,14 @@ class TestClosePosition:
         result = service.close_position('BTCUSDT', 0.5)
 
         assert result is not None
-        mock_client.futures_cancel_all_open_orders.assert_called_once_with(symbol='BTCUSDT')
+        assert [c.kwargs for c in mock_client.futures_cancel_all_open_orders.call_args_list] == [{'symbol': 'BTCUSDT'}, {'symbol': 'BTCUSDT', 'conditional': True}]
         mock_client.futures_create_order.assert_called_once_with(
             symbol='BTCUSDT',
             side='SELL',
             type='MARKET',
             quantity=0.5,
+            newOrderRespType='RESULT',
+            reduceOnly='true',
         )
 
 
@@ -249,5 +252,5 @@ class TestPositionManagerIntegration:
         latest_kline = pd.Series({'High': 112, 'Low': 98, 'Close': 111, 'Datetime': pd.Timestamp.now()})
         pm.update_positions({'BTCUSDT': latest_kline})
 
-        mock_client.futures_cancel_all_open_orders.assert_called_once_with(symbol='BTCUSDT')
+        assert [c.kwargs for c in mock_client.futures_cancel_all_open_orders.call_args_list] == [{'symbol': 'BTCUSDT'}, {'symbol': 'BTCUSDT', 'conditional': True}]
         mock_client.futures_create_order.assert_called_once()

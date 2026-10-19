@@ -9,7 +9,8 @@ logger = logging.getLogger(__name__)
 
 POSITION_COLUMNS = [
     'symbol', 'status', 'entry_price', 'stop_loss', 'take_profit',
-    'units', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'pnl'
+    'units', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'pnl',
+    'entry_order_id', 'entry_fill_price',
 ]
 
 
@@ -26,7 +27,10 @@ class PositionManager:
         """Loads positions from the CSV file or creates an empty DataFrame."""
         if os.path.exists(self.csv_path):
             try:
-                df = pd.read_csv(self.csv_path)
+                # 文字／時間欄固定讀成 object：pandas 3 會把全空欄推成 float64、把有值的推成 str，
+                # 之後寫入 exit_reason / exit_timestamp 會丟 TypeError（重啟後無法平倉）
+                df = pd.read_csv(self.csv_path, dtype={c: object for c in (
+                    'symbol', 'status', 'entry_timestamp', 'exit_timestamp', 'exit_reason', 'entry_order_id')})
                 for col in POSITION_COLUMNS:
                     if col not in df.columns:
                         df[col] = None
@@ -188,7 +192,7 @@ class PositionManager:
 
                 self.positions_df.loc[index, 'status'] = 'CLOSED'
                 self.positions_df.loc[index, 'exit_reason'] = exit_reason
-                self.positions_df.loc[index, 'exit_timestamp'] = kline['Datetime']
+                self.positions_df.loc[index, 'exit_timestamp'] = kline.get('Datetime', kline.get('Timestamp'))
                 self.positions_df.loc[index, 'pnl'] = pnl
                 logger.info(f"Closed position for {symbol} by {exit_reason}. PnL: {pnl:.2f}")
                 positions_closed = True
@@ -212,3 +216,81 @@ class PositionManager:
 
         if positions_closed:
             self._save_positions()
+
+    # --- Shotgun v3 ---
+    def paper_equity(self) -> float:
+        closed = self.positions_df[self.positions_df['status'] == 'CLOSED'] if not self.positions_df.empty else self.positions_df
+        realized = float(pd.to_numeric(closed['pnl'], errors='coerce').fillna(0).sum()) if len(closed) else 0.0
+        return float(self.strategy_config.get('TOTAL_CAPITAL')) + realized
+
+    def open_notional(self, symbol, price, timestamp, notional_pct, disaster_stop_pct) -> bool:
+        if symbol in self.get_open_positions_symbols():
+            logger.info(f"Position for {symbol} is already open. Ignoring BUY.")
+            return False
+        units = self.paper_equity() * notional_pct / price
+        stop = price * (1 - disaster_stop_pct)
+        row = {'symbol': symbol, 'status': 'OPEN', 'entry_price': price, 'stop_loss': stop,
+               'take_profit': float('nan'), 'units': units, 'entry_timestamp': timestamp,
+               'exit_timestamp': pd.NaT, 'exit_reason': None, 'pnl': -self._opening_fee(price, units),
+               'entry_order_id': None, 'entry_fill_price': float('nan')}
+        self.positions_df = pd.concat([self.positions_df, pd.DataFrame([row])], ignore_index=True)
+        self._save_positions()
+        idx = self.positions_df.index[-1]
+        info, orders = {"exchange": "disabled", "order_id": None, "fill_price": None}, None
+        if self.order_execution_service:
+            entry = None
+            try:
+                if self.order_execution_service.ensure_cross_margin(symbol):
+                    entry = self.order_execution_service.place_market_order(symbol, 'BUY', units)
+                else:
+                    logger.error(f"Aborting entry for {symbol}: failed to set CROSSED margin")
+            except Exception as e:
+                logger.error(f"Testnet entry order error for {symbol}: {e}")
+            if not entry:
+                # 交易所沒有這個倉 → 紙上也不留（否則之後的平倉會對一個不存在的部位下單）；下一根若條件仍成立會再試
+                self.positions_df = self.positions_df.drop(index=idx)
+                self._save_positions()
+                self.notification_service.send_heartbeat_notification(
+                    message=f"⚠️ {symbol} 交易所進場失敗，紙上不建倉")
+                return False
+            fill = float(entry.get('avgPrice') or 0) or None
+            info = {"exchange": "filled", "order_id": entry.get('orderId'), "fill_price": fill}
+            self.positions_df.loc[idx, ['entry_order_id', 'entry_fill_price']] = [
+                None if info["order_id"] is None else str(info["order_id"]), fill if fill else float('nan')]
+            self._save_positions()
+            sl = None
+            try:
+                for _ in range(3):
+                    sl = self.order_execution_service.place_stop_loss_order(symbol, 'SELL', units, stop)
+                    if sl:
+                        break
+            except Exception as e:
+                logger.error(f"Testnet stop order error for {symbol}: {e}")
+            if not sl:
+                self.notification_service.send_heartbeat_notification(
+                    message=f"⚠️ {symbol} 已進場但災難止損單掛不上（試 3 次），部位沒有交易所保護，請手動處理")
+            orders = {'entry': entry, 'stop_loss': sl}
+        self.notification_service.send_trade_notification(
+            symbol=symbol, action="BUY", price=price, units=units, stop_loss_price=stop,
+            is_volume_on=False, testnet_orders=orders)
+        return info
+
+    def close_by_signal(self, symbol, price, timestamp, reason="CROSS_10_20") -> bool:
+        idx = self.positions_df[(self.positions_df['symbol'] == symbol) & (self.positions_df['status'] == 'OPEN')].index
+        if idx.empty:
+            return False
+        i = idx[0]
+        pos = self.positions_df.loc[i]
+        fee = self.strategy_config.get('TRANSACTION_FEE_PERCENT')
+        pnl = (price - pos['entry_price']) * pos['units'] - self._opening_fee(pos['entry_price'], pos['units']) \
+            - price * pos['units'] * fee
+        self.positions_df.loc[i, ['status', 'exit_reason', 'exit_timestamp', 'pnl']] = ['CLOSED', reason, timestamp, pnl]
+        self._save_positions()
+        orders = self._execute_close_orders(symbol, pos['units'])
+        if self.order_execution_service and not orders:
+            self.notification_service.send_heartbeat_notification(
+                message=f"⚠️ {symbol} 交易所平倉失敗（試 3 次），紙上已記為平倉，交易所多單與止損單仍在，請手動處理")
+        self.notification_service.send_trade_notification(
+            symbol=symbol, action="SELL", price=price, units=pos['units'], reason=reason, pnl=pnl,
+            is_volume_on=False, testnet_orders=orders)
+        return True
