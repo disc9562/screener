@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 import queue
 import argparse
 import threading
@@ -15,7 +16,7 @@ from config import (
     get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET,
     USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET,
     NOTIONAL_PCT, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, EQUITY_LIKE_BASES, POSITIONS_CSV_V3,
-    SHADOW_LISTS_CSV, SHADOW_ENTRIES_CSV,
+    SHADOW_LISTS_CSV, SHADOW_ENTRIES_CSV, RS_MODE, MIN_DAILY_QUOTE_VOL,
 )
 from data.fetcher import CryptoFetcher
 from strategy.shotgun_v3_live import ShotgunV3Live
@@ -24,7 +25,11 @@ from services.websocket_manager import WebSocketManager
 from services.notification_service import NotificationService
 from services.order_execution_service import OrderExecutionService
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='application.log', filemode='w')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[RotatingFileHandler('application.log', maxBytes=20 * 1024 * 1024, backupCount=5, encoding='utf-8')],
+)
 
 
 def _init_order_execution_service():
@@ -182,13 +187,22 @@ def rollover(live, position_manager, ws, notification_service, cutoff, subscribe
         notification_service.send_heartbeat_notification(
             message=f"⚠️ {cutoff.date()} 名單計算失敗，5 分鐘後重試：{e}")
         return False
-    for s in (set(top) | set(position_manager.get_open_positions_symbols())) - set(live.states):
+    active = set(top) | set(position_manager.get_open_positions_symbols())
+    for s in active - set(live.states):
         live.warmup(s)
     new = set(top) - subscribed
     if new:
         ws.subscribe(sorted(new))
         subscribed |= new
-    notification_service.send_list_change_notification(added=set(top), removed=set(), webhook_type="general_targets")
+    stale = subscribed - active
+    if stale:
+        if hasattr(ws, "unsubscribe"):
+            ws.unsubscribe(sorted(stale))
+        subscribed -= stale
+        if isinstance(live.states, dict):
+            for s in stale:
+                live.states.pop(s, None)
+    notification_service.send_list_change_notification(added=set(top), removed=stale, webhook_type="general_targets")
     logging.info(f"Daily rebalance {cutoff.date()} bull={bull} list={top}")
     rows_4h, universe = dict(live.rows_4h), list(live.universe)
     _start_shadow(lambda: _shadow_job(live, cutoff, list(top), rows_4h, universe))
@@ -211,7 +225,7 @@ def run_app(args):
     position_manager = PositionManager(notification_service, strategy_config, POSITIONS_CSV_V3,
                                        order_execution_service=_init_order_execution_service())
     live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES,
-                         shadow_fetcher=CryptoFetcher())
+                         shadow_fetcher=CryptoFetcher(), rs_mode=RS_MODE, min_daily_quote_vol=MIN_DAILY_QUOTE_VOL)
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
     subscribed, ok = bootstrap(live, position_manager, now)
     cutoff = next_cutoff(now) if ok else now.normalize()      # 今日名單沒算成 → 進迴圈後立刻重試

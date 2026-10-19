@@ -177,3 +177,28 @@ def test_shadow_keeps_symbols_whose_4h_failed_and_records_age():
     assert set(by) == {"AAAUSDT", "BBBUSDT"}
     assert by["BBBUSDT"]["st4"] == "fetch_failed" and by["BBBUSDT"]["martin_status"] == "fetch_failed"
     assert by["AAAUSDT"]["age1"] == 0 and by["AAAUSDT"]["age24"] == 0       # 最後一根就是 cutoff 前剛收完的
+    assert by["AAAUSDT"]["in_rs_v2"] is True and by["AAAUSDT"]["rs_v2_rank"] == 1
+
+
+def test_rebalance_filters_low_liquidity_and_1000_prefix_and_stale():
+    class CustomFetcher(FakeFetcher):
+        def get_all_symbols(self):
+            return ["AAAUSDT", "LOWVOLUSDT", "STALEUSDT", "1000TSLAUSDT", "BTCUSDT"]
+
+        def fetch_klines(self, symbol, interval, limit):
+            if interval == "4h":
+                drift = 0.0 if symbol == "BTCUSDT" else 0.003
+                closes = 100 * np.exp(np.cumsum(np.full(300, drift)))
+                if symbol == "STALEUSDT":
+                    # 停牌合約：最後一根是 cutoff 前 24h
+                    return _rows(closes, T0 - (300 + 6) * 4 * H, 4 * H)
+                vol = 1.0 if symbol == "LOWVOLUSDT" else 50_000.0
+                return [[T0 - (300 - i) * 4 * H, c, c * 1.01, c * 0.99, c, vol, T0 - (299 - i) * 4 * H - 1, c * vol]
+                        for i, c in enumerate(closes)]
+            return super().fetch_klines(symbol, interval, limit)
+
+    live = ShotgunV3Live(CustomFetcher(), exclude_symbols=["BTCDOMUSDT"], exclude_bases={"TSLA"},
+                         now_ms=lambda: T0, rs_mode="v2", min_daily_quote_vol=1_000_000.0)
+    top, _ = live.daily_rebalance(pd.Timestamp(T0, unit="ms"))
+    assert top == ["AAAUSDT"]
+

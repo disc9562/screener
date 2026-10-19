@@ -100,3 +100,33 @@ def test_gap_raises():
     st = V.SymbolState.from_history(t, c)
     with pytest.raises(V.GapError):
         st.update(int(t[-1]) + 2 * V.HOUR_MS, 100.0)
+
+
+def test_skip_day_intact_rejects_last_day_crash():
+    """若最後 24 小時（被 skip 的 6 根 4h）發生閃崩或跌破 SMA60，skip_day_intact 與 rs_score_v2 必須拒絕。"""
+    up = 100 * np.exp(np.cumsum(np.full(300, 0.003)))
+    assert V.skip_day_intact(up, 299)
+    assert V.rs_score_v2(up, 299) is not None
+
+    crashed = up.copy()
+    crashed[-3:] *= 0.75   # 最後 12 小時閃崩 -25%，但舊版 rs_score 因跳過最後 6 根而看不見
+    assert V.rs_score(crashed, 299) == V.rs_score(up, 299)
+    assert not V.skip_day_intact(crashed, 299)
+    assert V.rs_score_v2(crashed, 299) is None
+
+
+def test_rs_score_v2_prefers_steady_trend_over_volatile_spike():
+    """相同累積漲幅下，穩定推升的趨勢幣在 rs_score_v2 的分數應高於暴漲暴跌的妖幣。"""
+    steady = 100 * np.exp(np.cumsum(np.full(300, 0.0025)))
+    noisy_rets = np.tile([-0.015, 0.02], 150)   # 平均每根同樣約 +0.0025，但鋸齒波動大
+    spiky = 100 * np.exp(np.cumsum(noisy_rets))
+    s_steady = V.rs_score_v2(steady, 299)
+    s_spiky = V.rs_score_v2(spiky, 299)
+    assert s_steady is not None and s_spiky is not None
+    assert s_steady > s_spiky
+
+
+def test_avg_daily_quote_vol():
+    rows_with_qv = [[i, 10, 11, 9, 10, 100, i + 1, 600_000.0] for i in range(42)]
+    assert np.isclose(V.avg_daily_quote_vol(rows_with_qv, days=7), 3_600_000.0)
+

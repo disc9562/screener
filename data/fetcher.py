@@ -1,3 +1,4 @@
+import logging
 import time
 import json
 from pathlib import Path
@@ -9,6 +10,8 @@ from urllib3.util.retry import Retry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 import threading
 from collections import deque
+
+logger = logging.getLogger(__name__)
 
 # Binance USDⓈ-M futures: 2400 request weight per IP per minute (exchangeInfo rateLimits).
 # Going over returns 429; ignoring 429s escalates to a 418 IP ban (2 minutes up to 3 days).
@@ -65,7 +68,7 @@ def _give_up(default):
     def callback(state):
         exc = state.outcome.exception()
         if isinstance(exc, _NETWORK_ERRORS):
-            print(f"Network error after {state.attempt_number} attempts: {exc}")
+            logger.warning(f"Network error after {state.attempt_number} attempts: {exc}")
             return default
         raise RetryError(state.outcome)
     return callback
@@ -101,7 +104,7 @@ class CryptoFetcher(BaseFetcher):
         try:
             self.client = Client(requests_params={"timeout": 30})
         except Exception as e:
-            print(f"Error initializing CryptoFetcher: {e}")
+            logger.error(f"Error initializing CryptoFetcher: {e}")
             self.client = None
 
     def _request(self, weight, fn, **kwargs):
@@ -126,15 +129,15 @@ class CryptoFetcher(BaseFetcher):
             return klines
         except BinanceAPIException as e:
             if _rate_limited(e):
-                print(f"Rate limit hit for {symbol} (HTTP {e.status_code}). Pausing all requests {_retry_after(e)}s, then retrying...")
+                logger.warning(f"Rate limit hit for {symbol} (HTTP {e.status_code}). Pausing all requests {_retry_after(e)}s, then retrying...")
                 raise # Re-raise to trigger tenacity retry
             else:
-                print(f"Error fetching klines for {symbol}: {e}")
+                logger.error(f"Error fetching klines for {symbol}: {e}")
                 return None
         except _NETWORK_ERRORS:
             raise                       # 交給 tenacity 重試（原本被下面的 except 吞掉，重試從沒觸發過）
         except Exception as e:
-            print(f"Error fetching klines for {symbol}: {e}")
+            logger.error(f"Error fetching klines for {symbol}: {e}")
             return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -152,13 +155,14 @@ class CryptoFetcher(BaseFetcher):
                           and item.get("status") == "TRADING")
         except BinanceAPIException as e:
             if _rate_limited(e):
-                print(f"Rate limit hit for getting all symbols. Retrying...")
+                logger.warning("Rate limit hit for getting all symbols. Retrying...")
                 raise # Re-raise to trigger tenacity retry
             else:
-                print(f"Error fetching crypto symbols from Binance: {e}")
+                logger.error(f"Error fetching crypto symbols from Binance: {e}")
                 return []
         except _NETWORK_ERRORS:
             raise
         except Exception as e:
-            print(f"Error fetching crypto symbols from Binance: {e}")
+            logger.error(f"Error fetching crypto symbols from Binance: {e}")
             return []
+

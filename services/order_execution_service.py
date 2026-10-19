@@ -1,5 +1,6 @@
 import logging
 import math
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from binance import Client
 
 logger = logging.getLogger(__name__)
@@ -36,20 +37,18 @@ class OrderExecutionService:
 
         try:
             info = self.client.futures_exchange_info()
-            for s in info['symbols']:
-                if s['symbol'] == symbol:
-                    filters = {f['filterType']: f for f in s.get('filters', [])}
-                    lot_size = filters.get('LOT_SIZE')
-                    price_filter = filters.get('PRICE_FILTER')
-
-                    result = {
-                        'quantityPrecision': s.get('quantityPrecision', 3),
-                        'pricePrecision': s.get('pricePrecision', 2),
-                        'stepSize': float(lot_size['stepSize']) if lot_size else None,
-                        'tickSize': float(price_filter['tickSize']) if price_filter else None,
-                    }
-                    self._symbol_info_cache[symbol] = result
-                    return result
+            for s in info.get('symbols', []):
+                filters = {f['filterType']: f for f in s.get('filters', [])}
+                lot_size = filters.get('LOT_SIZE')
+                price_filter = filters.get('PRICE_FILTER')
+                self._symbol_info_cache[s['symbol']] = {
+                    'quantityPrecision': s.get('quantityPrecision', 3),
+                    'pricePrecision': s.get('pricePrecision', 2),
+                    'stepSize': float(lot_size['stepSize']) if lot_size else None,
+                    'tickSize': float(price_filter['tickSize']) if price_filter else None,
+                }
+            if symbol in self._symbol_info_cache:
+                return self._symbol_info_cache[symbol]
             logger.warning(f"Symbol {symbol} not found in futures exchange info")
             return None
         except Exception as e:
@@ -65,8 +64,10 @@ class OrderExecutionService:
         """Round quantity down to match symbol's step size."""
         info = self.get_symbol_info(symbol)
         if info and info.get('stepSize'):
-            precision = self._precision_from_size(info['stepSize'])
-            return round(math.floor(quantity * 10**precision) / 10**precision, precision)
+            step = Decimal(str(info['stepSize']))
+            if step > 0:
+                q = (Decimal(str(quantity)) // step) * step
+                return float(q)
         if info:
             return round(quantity, info['quantityPrecision'])
         return round(quantity, 3)
@@ -75,7 +76,10 @@ class OrderExecutionService:
         """Round price to match symbol's tick size."""
         info = self.get_symbol_info(symbol)
         if info and info.get('tickSize'):
-            return round(price, self._precision_from_size(info['tickSize']))
+            tick = Decimal(str(info['tickSize']))
+            if tick > 0:
+                p = (Decimal(str(price)) / tick).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * tick
+                return float(p)
         if info:
             return round(price, info['pricePrecision'])
         return round(price, 2)
@@ -83,6 +87,9 @@ class OrderExecutionService:
     def place_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False) -> dict | None:
         """Place a market order on futures testnet. reduce_only=True can never open/flip a position."""
         qty = self._round_quantity(symbol, quantity)
+        if qty <= 0:
+            logger.error(f"Cannot place market {side} order for {symbol}: rounded quantity is {qty} (raw={quantity})")
+            return None
         params = dict(symbol=symbol, side=side, type='MARKET', quantity=qty,
                       newOrderRespType='RESULT')      # 回應帶實際成交均價 avgPrice 與成交量
         if reduce_only:
@@ -92,6 +99,9 @@ class OrderExecutionService:
             logger.info(f"Market {side} order placed: {symbol} qty={qty} reduceOnly={reduce_only} orderId={order.get('orderId')}")
             return order
         except Exception as e:
+            if reduce_only and getattr(e, 'code', None) == -2022:
+                logger.info(f"ReduceOnly {side} order for {symbol} rejected (-2022): position already closed on exchange")
+                return {"status": "ALREADY_CLOSED", "symbol": symbol}
             logger.error(f"Failed to place market {side} order for {symbol}: {e}")
             return None
 
@@ -99,6 +109,9 @@ class OrderExecutionService:
                                  stop_price: float, order_type: str) -> dict | None:
         """Place a STOP_MARKET or TAKE_PROFIT_MARKET order."""
         qty = self._round_quantity(symbol, quantity)
+        if qty <= 0:
+            logger.error(f"Cannot place {order_type} order for {symbol}: rounded quantity is {qty} (raw={quantity})")
+            return None
         price = self._round_price(symbol, stop_price)
         label = "Stop loss" if order_type == 'STOP_MARKET' else "Take profit"
         try:

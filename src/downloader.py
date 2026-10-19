@@ -207,15 +207,16 @@ class CryptoDownloader:
 
     def get_all_symbols(self):
         """
-        Get all USDT pairs in binance
+        Get all TRADING USDT perpetual pairs in binance
         """
         binance_response = self.binance_client.futures_exchange_info()
         binance_symbols = set()
         for item in binance_response["symbols"]:
-            symbol_name = item["pair"]
-            if symbol_name[-4:] == "USDT":
-                binance_symbols.add(symbol_name)
-        return list(binance_symbols)
+            if (item.get("quoteAsset") == "USDT"
+                    and item.get("contractType") == "PERPETUAL"
+                    and item.get("status") == "TRADING"):
+                binance_symbols.add(item["symbol"])
+        return sorted(binance_symbols)
 
     def get_futures_top(self, num):
         top_num = num + 2
@@ -223,9 +224,9 @@ class CryptoDownloader:
         try:
             futures_all = self.binance_client.futures_ticker()
             sorted_data = sorted(futures_all, key=lambda x: float(x['quoteVolume']), reverse=True)
-            top_10_quoteVolume_symbol =  [d['symbol'] for d in sorted_data[:top_num]]
+            top_10_quoteVolume_symbol = [d['symbol'] for d in sorted_data[:top_num]]
             for symbol in top_10_quoteVolume_symbol:
-                if 'BTC' not in symbol or 'ETH' not in symbol:
+                if 'BTC' not in symbol and 'ETH' not in symbol:
                     top_10_quoteVolume.append(symbol.split('USDT')[0])
             print(top_10_quoteVolume)
         except Exception as e:

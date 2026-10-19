@@ -192,7 +192,7 @@ class PositionManager:
 
                 self.positions_df.loc[index, 'status'] = 'CLOSED'
                 self.positions_df.loc[index, 'exit_reason'] = exit_reason
-                self.positions_df.loc[index, 'exit_timestamp'] = kline['Datetime']
+                self.positions_df.loc[index, 'exit_timestamp'] = kline.get('Datetime', kline.get('Timestamp'))
                 self.positions_df.loc[index, 'pnl'] = pnl
                 logger.info(f"Closed position for {symbol} by {exit_reason}. PnL: {pnl:.2f}")
                 positions_closed = True
@@ -240,8 +240,10 @@ class PositionManager:
         if self.order_execution_service:
             entry = None
             try:
-                self.order_execution_service.ensure_cross_margin(symbol)
-                entry = self.order_execution_service.place_market_order(symbol, 'BUY', units)
+                if self.order_execution_service.ensure_cross_margin(symbol):
+                    entry = self.order_execution_service.place_market_order(symbol, 'BUY', units)
+                else:
+                    logger.error(f"Aborting entry for {symbol}: failed to set CROSSED margin")
             except Exception as e:
                 logger.error(f"Testnet entry order error for {symbol}: {e}")
             if not entry:

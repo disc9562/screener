@@ -24,6 +24,7 @@ class WebSocketManager:
         self.thread = None
         self.ws_client = None
         self.symbols = []
+        self._lock = threading.Lock()
         self.interval = '15m'
         self.initial_notification_sent = False # Flag to track initial notification
         self.last_message_at = 0.0             # time.monotonic() of the last message of any kind
@@ -53,21 +54,23 @@ class WebSocketManager:
         self.logger.info("WebSocketManager thread started.")
         while self.is_running:
             try:
-                self.logger.info(f"Attempting to connect and subscribe to {len(self.symbols)} symbols...")
+                with self._lock:
+                    current_symbols = list(self.symbols)
+                self.logger.info(f"Attempting to connect and subscribe to {len(current_symbols)} symbols...")
                 self.ws_client = SpotWebsocketStreamClient(stream_url=self.stream_url, on_message=self._message_handler,
                                                            on_close=self._on_close, on_error=self._on_error)
                 
-                if not self.symbols:
+                if not current_symbols:
                     self.logger.warning("No symbols to subscribe to. Waiting...")
                     time.sleep(10) # Wait before retrying if no symbols
                     continue
 
-                streams = [f"{symbol.lower()}@kline_{self.interval}" for symbol in self.symbols]
+                streams = [f"{symbol.lower()}@kline_{self.interval}" for symbol in current_symbols]
                 self.ws_client.subscribe(stream=streams)
                 
                 # Only send notification on the very first successful subscription
                 if not self.initial_notification_sent:
-                    self.notification_service.send_subscription_notification(self.symbols, "initial")
+                    self.notification_service.send_subscription_notification(current_symbols, "initial")
                     self.initial_notification_sent = True
 
                 self.logger.info(f"Successfully subscribed to streams. Waiting for messages.")
@@ -110,7 +113,8 @@ class WebSocketManager:
             return
 
         self.is_running = True
-        self.symbols = list(set(symbols)) # Store unique symbols
+        with self._lock:
+            self.symbols = list(set(symbols)) # Store unique symbols
         self.interval = interval
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -122,12 +126,13 @@ class WebSocketManager:
             self.logger.warning("WebSocket client not started. Cannot subscribe.")
             return
 
-        new_symbols = [s for s in symbols if s not in self.symbols]
-        if not new_symbols:
-            self.logger.info("No new symbols to subscribe to.")
-            return
+        with self._lock:
+            new_symbols = [s for s in symbols if s not in self.symbols]
+            if not new_symbols:
+                self.logger.info("No new symbols to subscribe to.")
+                return
+            self.symbols.extend(new_symbols)
 
-        self.symbols.extend(new_symbols)
         streams = [f"{symbol.lower()}@kline_{self.interval}" for symbol in new_symbols]
         self.logger.info(f"Subscribing to additional streams: {streams}")
         if not self.ws_client:                 # 尚未連上：已加入 self.symbols，連上時會一併訂閱
@@ -139,6 +144,25 @@ class WebSocketManager:
             self.logger.error("Failed to subscribe to new symbols because the WebSocket connection is closed. The manager will attempt to reconnect automatically.")
         except Exception as e:
             self.logger.error(f"An unexpected error occurred during subscription: {e}")
+
+    def unsubscribe(self, symbols: list):
+        """Unsubscribes from symbols that are no longer needed."""
+        if not self.is_running:
+            return
+        with self._lock:
+            removed = [s for s in symbols if s in self.symbols]
+            if not removed:
+                return
+            self.symbols = [s for s in self.symbols if s not in set(removed)]
+        if not self.ws_client:
+            return
+        streams = [f"{symbol.lower()}@kline_{self.interval}" for symbol in removed]
+        self.logger.info(f"Unsubscribing from streams: {streams}")
+        try:
+            if hasattr(self.ws_client, "unsubscribe"):
+                self.ws_client.unsubscribe(stream=streams)
+        except Exception as e:
+            self.logger.warning(f"Failed to unsubscribe streams {streams}: {e}")
 
     def get_message(self, block=True, timeout=None):
         """Gets a message from the queue."""

@@ -1,7 +1,6 @@
 import pytest
 from unittest.mock import patch
 from services.notification_service import NotificationService
-from discord_webhook import DiscordEmbed
 
 @pytest.fixture
 def notification_service():
@@ -9,7 +8,8 @@ def notification_service():
     webhook_urls_map = {
         "volume_on": "https://dummy.url/webhook_on",
         "volume_off": "https://dummy.url/webhook_off",
-        "default": "https://dummy.url/webhook_default" # For list changes
+        "default": "https://dummy.url/webhook_default",
+        "general_targets": "https://dummy.url/webhook_general",
     }
     return NotificationService(webhook_urls_map=webhook_urls_map)
 
@@ -27,14 +27,11 @@ def test_send_buy_trade_notification_volume_on(mock_webhook_class, notification_
         is_volume_on=True
     )
 
-    mock_webhook_class.assert_called_once_with(url="https://dummy.url/webhook_on")
-    mock_instance.add_embed.assert_called_once()
-    
-    embed_arg = mock_instance.add_embed.call_args[0][0]
-    assert isinstance(embed_arg, DiscordEmbed)
-    assert "BUY BTCUSDT" in embed_arg.title
-    assert "[Volume ON]" in embed_arg.title # AC4
-    assert embed_arg.color == int("00ff00", 16)
+    mock_webhook_class.assert_called_once()
+    kwargs = mock_webhook_class.call_args.kwargs
+    assert kwargs["url"] == "https://dummy.url/webhook_on"
+    assert "BUY BTCUSDT" in kwargs["content"]
+    assert "[Volume ON]" in kwargs["content"]
 
 @patch('services.notification_service.DiscordWebhook')
 def test_send_buy_trade_notification_volume_off(mock_webhook_class, notification_service):
@@ -50,14 +47,11 @@ def test_send_buy_trade_notification_volume_off(mock_webhook_class, notification
         is_volume_on=False
     )
 
-    mock_webhook_class.assert_called_once_with(url="https://dummy.url/webhook_off")
-    mock_instance.add_embed.assert_called_once()
-    
-    embed_arg = mock_instance.add_embed.call_args[0][0]
-    assert isinstance(embed_arg, DiscordEmbed)
-    assert "BUY ETHUSDT" in embed_arg.title
-    assert "[Volume OFF]" in embed_arg.title # AC4
-    assert embed_arg.color == int("00ff00", 16)
+    mock_webhook_class.assert_called_once()
+    kwargs = mock_webhook_class.call_args.kwargs
+    assert kwargs["url"] == "https://dummy.url/webhook_off"
+    assert "BUY ETHUSDT" in kwargs["content"]
+    assert "[Volume OFF]" in kwargs["content"]
 
 @patch('services.notification_service.DiscordWebhook')
 def test_send_sell_trade_notification_volume_on(mock_webhook_class, notification_service):
@@ -75,13 +69,12 @@ def test_send_sell_trade_notification_volume_on(mock_webhook_class, notification
         is_volume_on=True
     )
 
-    mock_webhook_class.assert_called_once_with(url="https://dummy.url/webhook_on")
-    mock_instance.add_embed.assert_called_once()
-    embed_arg = mock_instance.add_embed.call_args[0][0]
-    assert "SELL ETHUSDT" in embed_arg.title
-    assert "[Volume ON]" in embed_arg.title # AC4
-    assert embed_arg.color == int("ff0000", 16)
-    assert any(field['name'] == 'Profit/Loss' and '500.00' in field['value'] for field in embed_arg.fields)
+    mock_webhook_class.assert_called_once()
+    kwargs = mock_webhook_class.call_args.kwargs
+    assert kwargs["url"] == "https://dummy.url/webhook_on"
+    assert "SELL ETHUSDT" in kwargs["content"]
+    assert "[Volume ON]" in kwargs["content"]
+    assert "Profit/Loss: 500.00 USD" in kwargs["content"]
 
 @patch('services.notification_service.DiscordWebhook')
 def test_send_sell_trade_notification_volume_off(mock_webhook_class, notification_service):
@@ -99,13 +92,12 @@ def test_send_sell_trade_notification_volume_off(mock_webhook_class, notificatio
         is_volume_on=False
     )
 
-    mock_webhook_class.assert_called_once_with(url="https://dummy.url/webhook_off")
-    mock_instance.add_embed.assert_called_once()
-    embed_arg = mock_instance.add_embed.call_args[0][0]
-    assert "SELL ETHUSDT" in embed_arg.title
-    assert "[Volume OFF]" in embed_arg.title # AC4
-    assert embed_arg.color == int("ff0000", 16)
-    assert any(field['name'] == 'Profit/Loss' and '500.00' in field['value'] for field in embed_arg.fields)
+    mock_webhook_class.assert_called_once()
+    kwargs = mock_webhook_class.call_args.kwargs
+    assert kwargs["url"] == "https://dummy.url/webhook_off"
+    assert "SELL ETHUSDT" in kwargs["content"]
+    assert "[Volume OFF]" in kwargs["content"]
+    assert "Profit/Loss: 500.00 USD" in kwargs["content"]
 
 @patch('services.notification_service.DiscordWebhook')
 def test_send_list_change_notification_volume_on(mock_webhook_class, notification_service):
@@ -119,13 +111,12 @@ def test_send_list_change_notification_volume_on(mock_webhook_class, notificatio
         is_volume_on=True
     )
 
-    mock_webhook_class.assert_called_once_with(url="https://dummy.url/webhook_on")
-    mock_instance.add_embed.assert_called_once()
-    embed_arg = mock_instance.add_embed.call_args[0][0]
-    assert "Strong Target List Updated [Volume ON]" in embed_arg.title # AC4
-    assert embed_arg.color == int("0000ff", 16)
-    assert any(field['name'] == '✅ Added' for field in embed_arg.fields)
-    assert any(field['name'] == '❌ Removed' for field in embed_arg.fields)
+    mock_webhook_class.assert_called_once()
+    kwargs = mock_webhook_class.call_args.kwargs
+    assert kwargs["url"] == "https://dummy.url/webhook_on"
+    assert "Strong Target List Updated [Volume ON]" in kwargs["content"]
+    assert "✅ Added:" in kwargs["content"]
+    assert "❌ Removed:" in kwargs["content"]
 
 @patch('services.notification_service.DiscordWebhook')
 def test_send_list_change_notification_volume_off(mock_webhook_class, notification_service):
@@ -139,13 +130,12 @@ def test_send_list_change_notification_volume_off(mock_webhook_class, notificati
         is_volume_on=False
     )
 
-    mock_webhook_class.assert_called_once_with(url="https://dummy.url/webhook_off")
-    mock_instance.add_embed.assert_called_once()
-    embed_arg = mock_instance.add_embed.call_args[0][0]
-    assert "Strong Target List Updated [Volume OFF]" in embed_arg.title # AC4
-    assert embed_arg.color == int("0000ff", 16)
-    assert any(field['name'] == '✅ Added' for field in embed_arg.fields)
-    assert any(field['name'] == '❌ Removed' for field in embed_arg.fields)
+    mock_webhook_class.assert_called_once()
+    kwargs = mock_webhook_class.call_args.kwargs
+    assert kwargs["url"] == "https://dummy.url/webhook_off"
+    assert "Strong Target List Updated [Volume OFF]" in kwargs["content"]
+    assert "✅ Added:" in kwargs["content"]
+    assert "❌ Removed:" in kwargs["content"]
 
 @patch('services.notification_service.DiscordWebhook')
 def test_disabled_service_no_webhook_url(mock_webhook_class):
@@ -162,4 +152,6 @@ def test_disabled_service_no_webhook_url(mock_webhook_class):
     
     # This call should trigger a webhook
     disabled_service.send_trade_notification('ETHUSDT', 'BUY', 4000, 1.0, is_volume_on=True)
-    mock_webhook_class.assert_called_once_with(url="https://dummy.url/webhook_on")
+    mock_webhook_class.assert_called_once()
+    assert mock_webhook_class.call_args.kwargs["url"] == "https://dummy.url/webhook_on"
+

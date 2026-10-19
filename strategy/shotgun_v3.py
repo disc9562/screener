@@ -55,20 +55,87 @@ def exit_signal(s10, s20):
     return bool(s10 < s20)
 
 
+def _sma_tail(arr, window, length):
+    """計算 arr 末端 length 個位置的簡單移動平均（window 期），純 NumPy 避免 pandas 物件開銷。"""
+    sub = arr[-(length + window - 1):]
+    cs = np.empty(len(sub) + 1, dtype=float)
+    cs[0] = 0.0
+    np.cumsum(sub, out=cs[1:])
+    return (cs[window:] - cs[:-window]) / window
+
+
 def rs_score(close_4h, end):
     """end = 開盤時間 < 當日 00:00 的最後一根 4h 索引；跳過 6 根後取 168 根，舊公式 Σ w_j·j。"""
     e = end - RS_BARS_PER_DAY
     if e + 1 < RS_BARS + 60:
         return None
-    s = pd.Series(np.asarray(close_4h[:e + 1], float))
-    m30, m45, m60 = (s.rolling(n).mean().to_numpy() for n in (30, 45, 60))
-    sl = slice(e - RS_BARS + 1, e + 1)
-    c, a30, a45, a60 = s.to_numpy()[sl], m30[sl], m45[sl], m60[sl]
+    arr = np.asarray(close_4h[:e + 1], dtype=float)
+    c = arr[-RS_BARS:]
+    a30 = _sma_tail(arr, 30, RS_BARS)
+    a45 = _sma_tail(arr, 45, RS_BARS)
+    a60 = _sma_tail(arr, 60, RS_BARS)
     j = np.arange(RS_BARS, dtype=float)
     w = (((c - a30) + (c - a45) + (c - a60)) * ((j * RS_DAYS / RS_BARS) + 1)
          + (a30 - a45) + (a30 - a60) + (a45 - a60)) / a60
     score = float(np.sum(w * j))
     return score if score != 0 and np.isfinite(score) else None
+
+
+def skip_day_intact(close_4h, end, max_skip_drop=0.15):
+    """檢查被跳過的最後 1 天（6 根 4h）結構是否完好：
+    1. 最新收盤價 close[end] 仍須在 4h SMA60 之上（未破趨勢生命線）
+    2. 最後 6 根內從高點回落不得超過 max_skip_drop（預設 15%，排除閃崩倒貨標的）"""
+    if end + 1 < 60 or end < RS_BARS_PER_DAY:
+        return False
+    arr = np.asarray(close_4h[:end + 1], dtype=float)
+    sma60_end = float(arr[-60:].mean())
+    if not (np.isfinite(sma60_end) and arr[-1] > sma60_end):
+        return False
+    recent_window = arr[-(RS_BARS_PER_DAY + 1):]
+    peak = float(np.max(recent_window))
+    if peak <= 0 or (arr[-1] / peak - 1.0) < -max_skip_drop:
+        return False
+    return True
+
+
+def rs_score_v2(close_4h, end, max_skip_drop=0.15):
+    """優化版 RS 分數：
+    1. 先過 skip_day_intact（排除最後 24h 閃崩或跌破 4h SMA60 的破位幣）
+    2. 消除原本 O(j^2) 的平方時間權重，改為 [1.0, 2.0] 線性時間遞增權重，兼顧整月趨勢與近期動能
+    3. 除以 4h 對數報酬率標準差（波動率正規化），獎勵穩定 45 度角推升、懲罰單日暴拉劇烈震盪的妖幣"""
+    e = end - RS_BARS_PER_DAY
+    if e + 1 < RS_BARS + 60:
+        return None
+    if not skip_day_intact(close_4h, end, max_skip_drop=max_skip_drop):
+        return None
+    arr = np.asarray(close_4h[:e + 1], dtype=float)
+    c = arr[-RS_BARS:]
+    if np.any(c <= 0):
+        return None
+    a30 = _sma_tail(arr, 30, RS_BARS)
+    a45 = _sma_tail(arr, 45, RS_BARS)
+    a60 = _sma_tail(arr, 60, RS_BARS)
+    # 要求跳過日當下（e）均線呈多頭結構（SMA30 > SMA60）且收盤在 SMA30 之上
+    if not (c[-1] > a30[-1] and a30[-1] >= a60[-1]):
+        return None
+    dev = (((c - a30) + (c - a45) + (c - a60)) + (a30 - a45) + (a30 - a60) + (a45 - a60)) / a60
+    time_weight = 1.0 + np.arange(RS_BARS, dtype=float) / (RS_BARS - 1)   # 1.0 → 2.0 線性權重
+    log_rets = np.diff(np.log(arr[-(RS_BARS + 1):]))
+    vol = max(float(np.std(log_rets)), 0.005)                              # 波動率下限 0.5%/4h 避免極低波幣分數無限放大
+    score = float(np.mean(dev * time_weight) / vol)
+    return score if score > 0 and np.isfinite(score) else None
+
+
+def avg_daily_quote_vol(rows_4h, days=7):
+    """由 4h K 線計算最近 days 天（預設 7 天 = 42 根 4h）的日均 USDT 成交額。
+    標準幣安 K 線第 7 欄為 quote_volume；若測試假資料無第 7 欄則以 close * volume 估算。"""
+    n_bars = days * RS_BARS_PER_DAY
+    recent = (rows_4h or [])[-n_bars:]
+    if not recent:
+        return 0.0
+    total = sum(float(r[7]) if len(r) > 7 else float(r[4]) * float(r[5]) for r in recent)
+    actual_days = max(len(recent) / RS_BARS_PER_DAY, 1.0)
+    return float(total / actual_days)
 
 
 def rank_top(scores, top_n=RS_TOP_N):
