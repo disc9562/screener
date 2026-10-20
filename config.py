@@ -88,10 +88,11 @@ def get_strategy_config():
     }
 
 # --- Shotgun v3（docs/shotgun-v3-bot-spec.md）---
-NOTIONAL_PCT = float(os.getenv("NOTIONAL_PCT", "0.04"))
+# NOTIONAL_PCT = 0.20 搭配 DISASTER_STOP_PCT = 0.20 => 單筆打到嚴格止損時最多損失總權益 4%（隨總權益複利縮放）
+NOTIONAL_PCT = float(os.getenv("NOTIONAL_PCT", "0.20"))
 DISASTER_STOP_PCT = float(os.getenv("DISASTER_STOP_PCT", "0.20"))
-RS_MODE = os.getenv("RS_MODE", "v2")
-MIN_DAILY_QUOTE_VOL = float(os.getenv("MIN_DAILY_QUOTE_VOL", "10000000"))
+RS_MODE = os.getenv("RS_MODE", "alligator")
+MIN_DAILY_QUOTE_VOL = float(os.getenv("MIN_DAILY_QUOTE_VOL", "1000000"))
 EXCLUDE_SYMBOLS = [s for s in os.getenv("EXCLUDE_SYMBOLS", "BTCDOMUSDT").split(",") if s]
 POSITIONS_CSV_V3 = "data/positions_shotgun_v3.csv"
 # 影子記錄（只記錄、不下單）：每日名單＋各時框斜率、每筆進場的斜率

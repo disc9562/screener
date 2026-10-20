@@ -38,7 +38,7 @@ def _dedup_sorted_rows(rows, cut_ms):
 
 class ShotgunV3Live:
     def __init__(self, fetcher, exclude_symbols=(), exclude_bases=(), now_ms=None, shadow_fetcher=None,
-                 fetch_workers=DEFAULT_FETCH_WORKERS, rs_mode="v2", min_daily_quote_vol=0.0):
+                 fetch_workers=DEFAULT_FETCH_WORKERS, rs_mode="alligator", min_daily_quote_vol=0.0):
         self.fetcher = fetcher
         self.shadow_fetcher = shadow_fetcher or fetcher   # 影子記錄在背景執行緒，用獨立 client（限速額度仍共用）
         self.exclude_symbols = set(exclude_symbols)
@@ -82,8 +82,16 @@ class ShotgunV3Live:
             return None
         if self.min_daily_quote_vol > 0 and V.avg_daily_quote_vol(rows) < self.min_daily_quote_vol:
             return None
+        if self.rs_mode == "martin30":
+            _, _, _, _, daily_c = SL.resample(rows, 4, 24, cut_ms)
+            r30, ok = SL.martin30(daily_c)
+            return float(r30) if ok and np.isfinite(r30) else None
         closes = np.array([float(r[4]) for r in rows])
         end = len(closes) - 1
+        if self.rs_mode == "alligator":
+            return V.alligator_4h_score(closes, end, require_233=True)
+        if self.rs_mode == "alligator50":
+            return V.alligator_4h_score(closes, end, require_233=False)
         if self.rs_mode == "v2":
             return V.rs_score_v2(closes, end)
         return V.rs_score(closes, end)

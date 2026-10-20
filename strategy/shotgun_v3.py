@@ -98,32 +98,35 @@ def skip_day_intact(close_4h, end, max_skip_drop=0.15):
     return True
 
 
-def rs_score_v2(close_4h, end, max_skip_drop=0.15):
-    """優化版 RS 分數：
-    1. 先過 skip_day_intact（排除最後 24h 閃崩或跌破 4h SMA60 的破位幣）
-    2. 消除原本 O(j^2) 的平方時間權重，改為 [1.0, 2.0] 線性時間遞增權重，兼顧整月趨勢與近期動能
-    3. 除以 4h 對數報酬率標準差（波動率正規化），獎勵穩定 45 度角推升、懲罰單日暴拉劇烈震盪的妖幣"""
-    e = end - RS_BARS_PER_DAY
-    if e + 1 < RS_BARS + 60:
-        return None
+def rs_score_v2(close_4h, end, max_skip_drop=0.12):
+    """優化版 RS v2（經歷史回測驗證）：
+    保留原版 RS v1 動能加權公式（容許算分點 e 處於整理蓄勢狀態），
+    並加上 skip_day_intact 破位保護（排除在被跳過的最後 24h 內閃崩超過 12% 或跌破 4h SMA60 的破位幣）。"""
     if not skip_day_intact(close_4h, end, max_skip_drop=max_skip_drop):
         return None
-    arr = np.asarray(close_4h[:e + 1], dtype=float)
-    c = arr[-RS_BARS:]
-    if np.any(c <= 0):
+    return rs_score(close_4h, end)
+
+
+def alligator_4h_score(close_4h, end, require_233=True):
+    """4h 鱷魚線（SMMA 10/20/50[/233]）多頭開口選股指標：
+    要求換日當下 close > SMMA10 > SMMA20 > SMMA50（若 require_233=True 則需 > SMMA233），
+    並以三線相對 SMMA50 的開口幅度排序。"""
+    min_bars = 250 if require_233 else 100
+    if end + 1 < min_bars:
         return None
-    a30 = _sma_tail(arr, 30, RS_BARS)
-    a45 = _sma_tail(arr, 45, RS_BARS)
-    a60 = _sma_tail(arr, 60, RS_BARS)
-    # 要求跳過日當下（e）均線呈多頭結構（SMA30 > SMA60）且收盤在 SMA30 之上
-    if not (c[-1] > a30[-1] and a30[-1] >= a60[-1]):
+    arr = np.asarray(close_4h[:end + 1], dtype=float)
+    s10 = float(rma_seeded(arr, 10)[-1])
+    s20 = float(rma_seeded(arr, 20)[-1])
+    s50 = float(rma_seeded(arr, 50)[-1])
+    c = float(arr[-1])
+    if not (np.isfinite(s50) and s50 > 0 and c > s10 > s20 > s50):
         return None
-    dev = (((c - a30) + (c - a45) + (c - a60)) + (a30 - a45) + (a30 - a60) + (a45 - a60)) / a60
-    time_weight = 1.0 + np.arange(RS_BARS, dtype=float) / (RS_BARS - 1)   # 1.0 → 2.0 線性權重
-    log_rets = np.diff(np.log(arr[-(RS_BARS + 1):]))
-    vol = max(float(np.std(log_rets)), 0.005)                              # 波動率下限 0.5%/4h 避免極低波幣分數無限放大
-    score = float(np.mean(dev * time_weight) / vol)
-    return score if score > 0 and np.isfinite(score) else None
+    if require_233:
+        s233 = float(rma_seeded(arr, 233)[-1])
+        if not (np.isfinite(s233) and s50 > s233):
+            return None
+    score = float(((c - s10) + (s10 - s20) + (s20 - s50)) / s50)
+    return score if np.isfinite(score) and score > 0 else None
 
 
 def avg_daily_quote_vol(rows_4h, days=7):
