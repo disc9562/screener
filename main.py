@@ -155,6 +155,52 @@ def handle_kline(message, live, position_manager, cfg):
     return action
 
 
+HOUR_BATCH_WAIT = 5.0   # 秒：同一根收完的 K 棒先收齊再一起處理（websocket 幾乎同時送達）
+
+
+def collect_batch(ws, first, expected, wait=HOUR_BATCH_WAIT, clock=time.monotonic):
+    """收到 first 之後，繼續收同一根（同開盤時間）的 K 棒，直到 expected 的幣都到齊或等滿 wait 秒。
+    回傳 (同一根的訊息, 其他時間的訊息)。"""
+    batch, others, seen = [first], [], {first['s']}
+    t_open = first['k']['t']
+    deadline = clock() + wait
+    while not set(expected) <= seen and clock() < deadline:
+        m = ws.get_message(block=True, timeout=max(0.0, deadline - clock()))
+        if not m:
+            continue
+        if m['k']['t'] == t_open:
+            batch.append(m)
+            seen.add(m['s'])
+        else:
+            others.append(m)
+    return batch, others
+
+
+def handle_batch(messages, live, position_manager, cfg):
+    """同一根收完的 K 棒一起處理：先處理有持倉的幣（紙上止損、訊號出場），再依幣名處理其他幣（進場）。
+    持倉滿格時，同一小時出場空出的格子才會給同一小時的進場（同研究；不受 websocket 送達順序影響）。"""
+    held = set(position_manager.get_open_positions_symbols())
+    actions = []
+    for m in sorted(messages, key=lambda m: (m['s'] not in held, m['s'])):
+        try:
+            actions.append(handle_kline(m, live, position_manager, cfg))
+        except Exception as e:
+            logging.error(f"handle_kline failed for {m.get('s')}: {e}", exc_info=True)
+            actions.append(None)
+    return actions
+
+
+def subscribe_open_positions(ws, position_manager, subscribed):
+    """持倉一定要有訂閱。換日後才處理的 23:00 那根（v3 慣例屬前一日名單）可能買進已不在新名單、剛被取消訂閱的幣，
+    之後收不到 K 棒就無法訊號出場（重播中每半年約 20 ~ 50 小時，最久到隔天換日）。補訂閱並回傳補上的幣。"""
+    missing = set(position_manager.get_open_positions_symbols()) - subscribed
+    if missing:
+        ws.subscribe(sorted(missing))
+        subscribed |= missing
+        logging.info(f"Subscribed open positions missing from the stream: {sorted(missing)}")
+    return missing
+
+
 def refresh_breadth(live, now):
     """每小時：基準不是最近一根 4h 收盤算的（每 4 小時一次；啟動或上次失敗時補算；00:00 換日已算過就跳過）就先更新，
     再用全市場價格更新寬度讀數。"""
@@ -301,10 +347,11 @@ def run_app(args):
                 gate = hourly_gate(live, position_manager, notification_service, now, gate)
                 breadth_hour = now.floor("h")
             if message:
-                try:
-                    handle_kline(message, live, position_manager, cfg)
-                except Exception as e:
-                    logging.error(f"handle_kline failed for {message.get('s')}: {e}", exc_info=True)
+                batch, others = collect_batch(ws, message, subscribed)
+                handle_batch(batch, live, position_manager, cfg)
+                if others:
+                    handle_batch(others, live, position_manager, cfg)
+                subscribe_open_positions(ws, position_manager, subscribed)
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")
     finally:

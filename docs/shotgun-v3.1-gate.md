@@ -36,8 +36,9 @@ v3 管線用逐小時持倉模擬重跑，期間是 2023-10 ~ 2025-01（樣本�
 | `strategy/shotgun_v3_live.py` | `daily_rebalance` 順便算寬度基準與換日讀數；`refresh_breadth_base`（每 4h）、`refresh_breadth`（每小時）、`breadth_now`、`gate_state`、`gate_off_reason`、`price_for`；`on_closed_kline` 進場改用 `gate_on` |
 | `data/fetcher.py` | `fetch_prices()`：全市場最新價格，一次請求（權重 2） |
 | `services/position_manager.py` | `open_notional(..., max_positions)`、`sizing_equity()`、`close_all(prices, ts, reason)` |
-| `main.py` | 每個整點先 `hourly_gate`（更新寬度 → 開關狀態改變時通知 → 確定關掉就全平），再處理該整點收完的 K 棒 |
+| `main.py` | 每個整點先 `hourly_gate`（更新寬度 → 開關狀態改變時通知 → 確定關掉就全平），再用 `collect_batch`／`handle_batch` 一起處理該整點收完的 K 棒（先處理有持倉的幣，再依幣名處理進場），最後 `subscribe_open_positions` 補訂閱沒訂閱的持倉 |
 | `config.py` | `NOTIONAL_PCT` 預設 0.10、`MAX_POSITIONS`、`BREADTH_ON`、`BREADTH_MIN_DAILY_QV` |
+| `tools/replay_v31.py` | 端到端重播：歷史 K 線依時間逐小時餵給上面這些實盤程式，見下方「端到端重播」 |
 
 ### 寬度怎麼算、多久算一次
 
@@ -56,8 +57,16 @@ v3 管線用逐小時持倉模擬重跑，期間是 2023-10 ~ 2025-01（樣本�
 - 主迴圈先取一則 K 棒訊息，接著依序處理：
   1. 換日（`rollover`）；
   2. 若進入新的整點，跑 `hourly_gate`；
-  3. 最後才處理那則 K 棒。
+  3. 最後處理 K 棒：先把同一根（同開盤時間）的訊息收齊（訂閱的幣都到了，或最多等 5 秒），再一起處理。
 - 這樣每根 1h K 棒的進場判斷，用的是同一個整點的寬度（和研究一致）。
+- 一起處理時，先處理有持倉的幣（紙上止損、SMMA 出場），再依幣名處理其他幣（進場）。持倉滿格時，同一小時出場空出的格子才會給同一小時的進場；原本逐則處理時，結果取決於 websocket 送達順序。重播比對時就是這一點造成 bot 和研究不一致，修正後逐筆相同。
+
+### 順便修掉的原版問題：持倉沒有訂閱
+
+- 換日時 `rollover` 先算新名單、取消訂閱不在「新名單 ∪ 持倉」的幣，之後才處理 23:00 那根 K 棒。
+- 依 v3 慣例那根屬前一日名單，所以可能買進一個剛被取消訂閱的幣。之後收不到它的 K 棒，就無法 SMMA 出場，只剩交易所端 −20% 災難止損，最久要到隔天換日才重新訂閱。
+- 重播 v3.1 六段時，每段都發生：每半年約 19 ~ 48 小時有持倉沒被監控。
+- 修正：`main.subscribe_open_positions` 在每批 K 棒處理完後，把沒訂閱的持倉補訂閱（狀態已在那根處理時從 REST 重建）。
 - 開關關掉時的全平在同一個整點執行，紙上平倉價用剛抓到的全市場價格；交易所端走原本的 `close_position`（reduceOnly 市價單 + 撤止損）。
 - 開關狀態（on／off／unknown）改變時，Discord 會收到「大盤開關 …｜BTC 日線 …，寬度 …」；全平時另發「大盤開關關閉…全部平倉 N 檔」。
 

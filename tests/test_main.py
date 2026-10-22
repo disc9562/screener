@@ -264,6 +264,50 @@ def test_report_gate_notifies_only_on_change():
     notif.send_heartbeat_notification.assert_not_called()
 
 
+def test_handle_batch_handles_exits_before_entries():
+    """持倉滿格時，同一小時出場空出的格子要給同一小時的進場：先處理有持倉的幣，再依幣名處理其他幣。"""
+    live, pm, order = MagicMock(), MagicMock(), []
+    pm.get_open_positions_symbols.return_value = ["ZZZUSDT"]
+    live.on_closed_kline.side_effect = lambda symbol, open_ms, close, has_position: "SELL" if has_position else "BUY"
+    pm.close_by_signal.side_effect = lambda symbol, *a, **k: order.append(("SELL", symbol))
+    pm.open_notional.side_effect = lambda symbol, *a, **k: order.append(("BUY", symbol))
+    cfg = {"NOTIONAL_PCT": 0.10, "DISASTER_STOP_PCT": 0.2, "MAX_POSITIONS": 1}
+    msgs = [_msg("BBBUSDT", 0), _msg("ZZZUSDT", 0), _msg("AAAUSDT", 0)]
+    assert main.handle_batch(msgs, live, pm, cfg) == ["SELL", "BUY", "BUY"]
+    assert order == [("SELL", "ZZZUSDT"), ("BUY", "AAAUSDT"), ("BUY", "BBBUSDT")]
+
+
+def test_collect_batch_waits_for_the_same_bar_until_all_arrive_or_timeout():
+    class FakeWs:
+        def __init__(self, msgs):
+            self.msgs = list(msgs)
+
+        def get_message(self, block=True, timeout=None):
+            return self.msgs.pop(0) if self.msgs else None
+
+    ticks = iter(range(100))
+    clock = lambda: next(ticks)                                                      # noqa: E731  每次呼叫 +1 秒
+    ws = FakeWs([_msg("BBBUSDT", 0), _msg("XXXUSDT", 3_600_000), _msg("CCCUSDT", 0)])
+    batch, others = main.collect_batch(ws, _msg("AAAUSDT", 0), {"AAAUSDT", "BBBUSDT", "CCCUSDT"}, wait=10, clock=clock)
+    assert [m["s"] for m in batch] == ["AAAUSDT", "BBBUSDT", "CCCUSDT"] and [m["s"] for m in others] == ["XXXUSDT"]
+    ws = FakeWs([_msg("BBBUSDT", 0)])                                                # DDD 沒來 → 等滿就放行
+    batch, _ = main.collect_batch(ws, _msg("AAAUSDT", 0), {"AAAUSDT", "BBBUSDT", "DDDUSDT"}, wait=5, clock=clock)
+    assert [m["s"] for m in batch] == ["AAAUSDT", "BBBUSDT"]
+
+
+def test_subscribe_open_positions_adds_only_missing_symbols():
+    """換日後處理的 23:00 那根買進了剛被取消訂閱的幣 → 要補訂閱，否則收不到 K 棒、無法訊號出場。"""
+    ws, pm = MagicMock(), MagicMock()
+    pm.get_open_positions_symbols.return_value = ["AAAUSDT", "BBBUSDT"]
+    subscribed = {"AAAUSDT", "CCCUSDT"}
+    assert main.subscribe_open_positions(ws, pm, subscribed) == {"BBBUSDT"}
+    ws.subscribe.assert_called_once_with(["BBBUSDT"])
+    assert subscribed == {"AAAUSDT", "BBBUSDT", "CCCUSDT"}
+    ws.reset_mock()
+    assert main.subscribe_open_positions(ws, pm, subscribed) == set()
+    ws.subscribe.assert_not_called()
+
+
 def test_hourly_gate_refreshes_then_reports_then_enforces():
     live, pm, notif, order = MagicMock(), MagicMock(), MagicMock(), []
     live.days, live.breadth_on, live.breadth_smas, live.breadth_base_ms = {}, 0.5, {}, _ms("2026-01-02 04:00")
