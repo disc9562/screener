@@ -136,3 +136,30 @@ def test_alligator_4h_score_requires_alignment():
     assert V.alligator_4h_score(down, 299, require_233=True) is None
 
 
+def _rows4h(closes, cut_ms, qv_per_bar=1_000_000.0):
+    """最後一根剛好在 cut_ms 收完的 4h K 線；每根成交額 qv_per_bar（一天 6 根）。"""
+    n = len(closes)
+    return [[cut_ms - (n - i) * 4 * V.HOUR_MS, c, c, c, c, 1.0, cut_ms - (n - 1 - i) * 4 * V.HOUR_MS - 1, qv_per_bar]
+            for i, c in enumerate(closes)]
+
+
+def test_breadth_sma_requires_fresh_long_liquid_series():
+    cut = 1000 * 4 * V.HOUR_MS
+    closes = np.linspace(100, 160, 121)
+    rows = _rows4h(closes, cut)                                              # 每天 600 萬 U → 可交易
+    assert np.isclose(V.breadth_sma(rows, cut), closes[-120:].mean())       # 最近 120 根 = 20 日均線
+    assert V.breadth_sma(rows[:-1], cut) is None                              # 最後一根不是剛收完（停牌／斷線）
+    assert V.breadth_sma(rows[-119:], cut) is None                            # 不足 120 根
+    assert V.breadth_sma(_rows4h(closes, cut, qv_per_bar=500_000.0), cut) is None   # 每天 300 萬 U < 500 萬
+
+
+def test_breadth_share_and_gate():
+    smas = {"A": 10.0, "B": 10.0, "C": 10.0, "D": 10.0}
+    prices = {"A": 11.0, "B": 9.0, "C": 10.5, "E": 50.0}                    # D 沒價格、E 不是可交易幣
+    assert V.breadth(prices, smas) == 2 / 3
+    assert V.breadth({}, smas) is None and V.breadth(prices, {}) is None
+    assert V.gate_on(True, 0.5) and not V.gate_on(True, 0.49)
+    assert not V.gate_on(False, 0.9)                                          # BTC 跌破 EMA200
+    assert not V.gate_on(True, None)                                          # 寬度未知 → 不開新倉
+
+

@@ -15,6 +15,10 @@ RS_BARS_PER_DAY, RS_DAYS, RS_TOP_N = 6, 28, 20
 RS_BARS = RS_BARS_PER_DAY * RS_DAYS
 BTC_EMA_SPAN = 200
 HOUR_MS = 3_600_000
+# 大盤寬度（docs/shotgun-v3.1-gate.md）：流動幣中，價格站上自己 20 日均線（120 根 4h）的比例
+BREADTH_SMA_BARS = 120
+BREADTH_MIN_DAILY_QV = 5_000_000
+BREADTH_ON = 0.5
 
 
 def rma_seeded(values, n):
@@ -148,6 +152,31 @@ def rank_top(scores, top_n=RS_TOP_N):
 def btc_bull(daily_closes):
     c = pd.Series(np.asarray(daily_closes, float))
     return bool(c.iloc[-1] > c.ewm(span=BTC_EMA_SPAN, adjust=False).mean().iloc[-1])
+
+
+def breadth_sma(rows_4h, cut_ms, sma_bars=BREADTH_SMA_BARS, min_daily_qv=BREADTH_MIN_DAILY_QV):
+    """單一幣的寬度基準：cut_ms 前收完的最近 sma_bars 根 4h 收盤平均（20 日均線）。
+    rows_4h 須已依開盤時間排序去重、只含 cut_ms 前的 K 棒。最後一根不是剛在 cut_ms 收完（停牌／斷線）、
+    根數不足、或 7 日日均成交額 < min_daily_qv（不算可交易幣）→ None。"""
+    rows = rows_4h or []
+    if len(rows) < sma_bars or int(rows[-1][0]) != cut_ms - 4 * HOUR_MS:
+        return None
+    if avg_daily_quote_vol(rows) < min_daily_qv:
+        return None
+    return float(np.mean([float(r[4]) for r in rows[-sma_bars:]]))
+
+
+def breadth(prices, smas):
+    """寬度 = 有基準又有價格的幣中，價格 > 20 日均線的比例；一個都沒有 → None。"""
+    pairs = [(prices[s], m) for s, m in smas.items() if s in prices and np.isfinite(prices[s])]
+    if not pairs:
+        return None
+    return sum(p > m for p, m in pairs) / len(pairs)
+
+
+def gate_on(bull, breadth_value, breadth_on=BREADTH_ON):
+    """新倉開關：BTC 日線在 EMA200 之上，且寬度 ≥ breadth_on。寬度未知 → 關（不進新倉）。"""
+    return bool(bull) and breadth_value is not None and breadth_value >= breadth_on
 
 
 class GapError(Exception):

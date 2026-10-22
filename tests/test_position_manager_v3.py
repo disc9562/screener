@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 
 from services.order_execution_service import OrderExecutionService
@@ -186,3 +187,41 @@ def test_entry_records_order_id_and_fill_price(tmp_path):
 def test_paper_only_mode_reports_exchange_disabled(tmp_path):
     pm, _ = _pm(tmp_path)
     assert pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.04, 0.20)["exchange"] == "disabled"
+
+
+# ---------- v3.1：持倉上限、下單權益、全部平倉（docs/shotgun-v3.1-gate.md） ----------
+
+def test_open_notional_respects_max_positions(tmp_path):
+    pm, _ = _pm(tmp_path)
+    ts = pd.Timestamp("2026-01-01")
+    assert pm.open_notional("AAAUSDT", 2.0, ts, 0.10, 0.20, max_positions=2)
+    assert pm.open_notional("BBBUSDT", 2.0, ts, 0.10, 0.20, max_positions=2)
+    assert not pm.open_notional("CCCUSDT", 2.0, ts, 0.10, 0.20, max_positions=2)       # 已滿
+    pm.close_by_signal("AAAUSDT", 2.0, pd.Timestamp("2026-01-02"))
+    assert pm.open_notional("CCCUSDT", 2.0, ts, 0.10, 0.20, max_positions=2)
+
+
+def test_sizing_equity_counts_floating_losses_not_gains(tmp_path):
+    pm, _ = _pm(tmp_path)
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.10, 0.20)            # 500 單位
+    fee = 500 * 2.0 * 0.0005
+    k = pd.Series({"Datetime": pd.Timestamp("2026-01-02"), "High": 2.0, "Low": 1.8, "Close": 1.8})
+    pm.update_positions({"AAAUSDT": k})
+    assert np.isclose(pm.sizing_equity(), 10000.0 - 100.0 - fee)                      # 浮虧要扣
+    assert pm.open_notional("BBBUSDT", 1.0, pd.Timestamp("2026-01-02"), 0.10, 0.20)
+    assert np.isclose(pm.positions_df.iloc[-1]["units"], (10000.0 - 100.0 - fee) * 0.10 / 1.0)
+    k = pd.Series({"Datetime": pd.Timestamp("2026-01-03"), "High": 2.5, "Low": 2.3, "Close": 2.4})
+    pm.update_positions({"AAAUSDT": k})
+    assert pm.sizing_equity() == pm.paper_equity()                                      # 浮盈不加碼
+
+
+def test_close_all_closes_every_position_with_reason(tmp_path):
+    pm, _ = _pm(tmp_path)
+    ts = pd.Timestamp("2026-01-01")
+    pm.open_notional("AAAUSDT", 2.0, ts, 0.10, 0.20)
+    pm.open_notional("BBBUSDT", 1.0, ts, 0.10, 0.20)
+    closed = pm.close_all({"AAAUSDT": 2.2}, pd.Timestamp("2026-01-02"), "GATE_OFF_BTC")
+    assert sorted(closed) == ["AAAUSDT", "BBBUSDT"] and pm.get_open_positions_symbols() == []
+    rows = pm.positions_df.set_index("symbol")
+    assert (rows["exit_reason"] == "GATE_OFF_BTC").all()
+    assert rows.loc["AAAUSDT", "pnl"] > 0 and rows.loc["BBBUSDT", "pnl"] < 0          # BBB 沒價格 → 用進場價，只剩手續費

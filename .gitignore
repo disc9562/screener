@@ -8,4 +8,5 @@ __pycache__/
 .pytest_cache/
 output.txt
 data/backtest_cache/
+data/replay_v31/
 

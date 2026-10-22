@@ -1,5 +1,7 @@
 # Shotgun v3 上 bot — 規格（2026-10-14，待使用者審閱）
 
+> 2026-10-22 v3.1 提案（`docs/shotgun-v3.1-gate.md`）：進出場不變，改成持倉上限 10 × 名目 10%、新倉開關為「BTC 日線 > EMA200 且 寬度 ≥ 50%」、任一確定關掉就全部平倉。下面「名目 4%」「BTC 開關」等是 v3 原規格。
+
 研究依據（core_backtests repo）：`docs/shotgun_wide_results.md`（§10.14）、`docs/shotgun_trend_parts_results.md`（§10.16）。
 策略 = 定案配方 ＋ BTC 日線 EMA200 開關 ＋ 每筆名目 4%。回測（名目 4%）：樣本內年化 32.3%／回撤 −20.6%，樣本外年化 34.8%／回撤 −15.0%。
 **bot 的交易邏輯必須和回測逐筆一致**；任何偏差都要先在「重播對帳」裡被抓到才上 testnet。
