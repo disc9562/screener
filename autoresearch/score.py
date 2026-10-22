@@ -2,6 +2,7 @@
 import argparse
 import importlib
 import json
+import os
 import random
 import sys
 import time
@@ -91,12 +92,40 @@ def _view(trades, cut):
     return sorted(out, key=lambda x: (x[1], x[0]))
 
 
-def prefix_ok(cand, base5m, gates, r, start_ms, end_ms, full: SimResult, cuts: list[int]) -> bool:
+def _same_arr(a, b) -> bool:
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    if a.dtype.kind == "f" or b.dtype.kind == "f":
+        return bool(np.allclose(a.astype(float), b.astype(float), rtol=1e-9, atol=0, equal_nan=True))
+    return bool(np.array_equal(a, b))
+
+
+def _signals_prefix_ok(p_cut, p_full) -> bool:
+    """截斷資料算出的每個 signals 陣列，必須等於完整資料算出的陣列的前綴。"""
+    for s, sig in p_cut.sig.items():
+        if s not in p_full.sig:
+            return False
+        n = len(p_cut.bars[s])
+        full_sig = p_full.sig[s]
+        if set(sig) != set(full_sig):
+            return False
+        for k, v in sig.items():
+            if len(v) != n or len(full_sig[k]) < n or not _same_arr(v, np.asarray(full_sig[k])[:n]):
+                return False
+    return True
+
+
+def prefix_ok(cand, base5m, gates, r, start_ms, end_ms, full: SimResult, cuts: list[int],
+              full_prep=None) -> bool:
     for cut in cuts:
         trunc = {s: b.window(0, int(np.searchsorted(b.t + 5 * MIN_MS, cut, "right")))
                  for s, b in base5m.items()}
         g = {d: v for d, v in gates.items() if d < cut}
-        res = simulate(cand, prepare(cand, trunc, cut), g, r, start_ms, cut)
+        p_cut = prepare(cand, trunc, cut)
+        if full_prep is not None and not _signals_prefix_ok(p_cut, full_prep):
+            return False
+        res = simulate(cand, p_cut, g, r, start_ms, cut)
         a, b = _view(full.trades, cut), _view(res.trades, cut)
         if len(a) != len(b):
             return False
@@ -183,7 +212,7 @@ def evaluate(cand, base5m: dict[str, Bars], universe: list[str], *, baseline: bo
             span = end_ms - start_ms
             cuts = [int(rng.uniform(start_ms + 0.2 * span, end_ms - 0.05 * span)) // DAY_MS * DAY_MS
                     for _ in range(2)]
-            ok = prefix_ok(cand, uni5m, gates, cal.r, start_ms, end_ms, res, cuts)
+            ok = prefix_ok(cand, uni5m, gates, cal.r, start_ms, end_ms, res, cuts, full_prep=p)
             secs["prefix"] = time.time() - t0
             if ok:
                 out.update(status="pass", reason=cal.status)
@@ -192,6 +221,12 @@ def evaluate(cand, base5m: dict[str, Bars], universe: list[str], *, baseline: bo
     except Exception as e:
         out["status"], out["reason"] = "fail", f"error: {type(e).__name__}: {str(e)[:200]}"
     return out
+
+
+def _jsonable(o):
+    if isinstance(o, np.generic):
+        return o.item()
+    return str(o)
 
 
 def main(argv=None) -> int:
@@ -207,8 +242,14 @@ def main(argv=None) -> int:
         out = evaluate(cand, base5m, universe, baseline=a.baseline, seed=a.seed)
     except Exception as e:
         out = {"status": "fail", "reason": f"error: {type(e).__name__}: {str(e)[:200]}"}
-    with open(a.out, "w") as f:
-        json.dump(out, f)
+    try:
+        text = json.dumps(out, default=_jsonable)
+    except Exception as e:
+        text = json.dumps({"status": "fail", "reason": f"error: {type(e).__name__}: {str(e)[:200]}"})
+    tmp = a.out + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, a.out)
     return 0
 
 

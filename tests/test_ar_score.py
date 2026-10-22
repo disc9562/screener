@@ -1,3 +1,4 @@
+import json
 import math
 from types import SimpleNamespace
 
@@ -56,6 +57,8 @@ def test_fixed_pct_stop_detects_95_percent():
 def _walk(seed, n):
     rng = np.random.default_rng(seed)
     c = 100 * np.exp(np.cumsum(rng.normal(0, 0.004, n)))
+    # 每天 00 時整點小時大幅跳高，讓「看下一根」在每個整天 cut 都一定改變最後一根的 entry
+    c = c * np.where((np.arange(n) * 5 // 60) % 24 == 0, 1.05, 1.0)
     z = np.ones(n)
     return Bars(np.arange(n, dtype=np.int64) * 5 * MIN_MS, c, c * 1.002, c * 0.998, c, z, z)
 
@@ -80,12 +83,37 @@ def test_prefix_check_catches_lookahead():
     base = {"A": _walk(1, days * 288), "B": _walk(2, days * 288)}
     end = days * DAY_MS
     gates = {d * DAY_MS: frozenset("AB") for d in range(days)}
-    cuts = [10 * DAY_MS, 15 * DAY_MS]
     for peek, expect in ((False, True), (True, False)):
         cand = _cand(peek)
-        full = simulate(cand, prepare(cand, base, end), gates, 0.02, 0, end)
+        prep = prepare(cand, base, end)
+        full = simulate(cand, prep, gates, 0.02, 0, end)
         assert len(full.trades) > 20
-        assert score.prefix_ok(cand, base, gates, 0.02, 0, end, full, cuts) is expect
+        for d in range(6, 19, 2):
+            got = score.prefix_ok(cand, base, gates, 0.02, 0, end, full, [d * DAY_MS], full_prep=prep)
+            assert got is expect, (peek, d)
+
+
+def test_cli_always_writes_json(monkeypatch, tmp_path):
+    out = tmp_path / "o.json"
+
+    def boom():
+        raise RuntimeError("no data")
+
+    monkeypatch.setattr(data, "load_all", boom)
+    assert score.main(["--out", str(out), "--seed", "1"]) == 0
+    assert json.loads(out.read_text())["status"] == "fail"
+
+    out2 = tmp_path / "o2.json"
+    monkeypatch.setattr(data, "load_all", lambda: ([], {}))
+    monkeypatch.setattr(score, "evaluate", lambda *a, **k: {"status": "pass", "description": object(), 1.5: np.int64(3), (1,): 2})
+    assert score.main(["--out", str(out2), "--seed", "1"]) == 0
+    assert json.loads(out2.read_text())["status"] == "fail"
+
+    out3 = tmp_path / "o3.json"
+    monkeypatch.setattr(score, "evaluate", lambda *a, **k: {"status": "pass", "description": object(), "n": np.int64(3)})
+    assert score.main(["--out", str(out3), "--seed", "1"]) == 0
+    assert json.loads(out3.read_text())["n"] == 3
+    assert not (tmp_path / "o3.json.tmp").exists()
 
 
 def test_yearly_and_coin_share():
