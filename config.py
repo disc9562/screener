@@ -104,7 +104,7 @@ POSITIONS_CSV_V3 = "data/positions_shotgun_v3.csv"
 SHADOW_LISTS_CSV = "data/shadow_lists.csv"
 SHADOW_ENTRIES_CSV = "data/shadow_entries.csv"
 # 實盤母體只取 Binance 標記為 COIN 的永續（股票／商品是 TRADIFI_PERPETUAL、指數是 INDEX，不會進來），
-# 再排除這些非加密資產：穩定幣與黃金代幣（同使用者研究 download_hist.py 的母體）
+# 再排除這些非加密資產：穩定幣與黃金代幣（同研究端 download_hist.py 的母體）
 NON_CRYPTO_BASES = set("USDC FDUSD TUSD USDP DAI USDE USD1 BUSD EUR AEUR XAUT PAXG".split())
 # 代幣化股票／商品／穩定幣（同研究 portfolio_backtest.EQUITY_LIKE + 穩定幣對）。只留給研究工具；
 # 實盤不再用：股票代號和 CVX（Convex）、T（Threshold）、F（SynFutures）、CAT（1000CAT）等幣撞名，會誤排除

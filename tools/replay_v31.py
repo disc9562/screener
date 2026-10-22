@@ -4,13 +4,13 @@
 main.handle_kline、PositionManager（紙上模式）。順序照 main.run_app：整點先換日（00:00）→ 更新寬度與開關 →
 再處理該整點收完的 K 棒（訂閱的是換日前的「名單 ∪ 持倉」）。資料只給「模擬當下已收完」的 K 棒。
 
-資料夾格式（使用者研究 強勢標的/research/download_hist.py 下載的格式）：
+資料夾格式（研究端 download_hist.py 下載的格式；資料不在這個 repo）：
   <data>/1h/<SYMBOL>.pkl = {"df": DataFrame[open_time, open, high, low, close, quote_volume, ...]}
   <data>/btc_1d.json     = Binance BTCUSDT 永續日線（起點前至少 1000 天）
 4h 由 1h 合成（只用 4 根齊全的）。母體 = 模擬當下有資料的幣（倖存者偏差同研究）。
 
 用法：
-  python tools/replay_v31.py --data ../research/cache_2025 --start 2025-08-01 --end 2026-02-01
+  python tools/replay_v31.py --data <K 線快取資料夾> --start 2025-08-01 --end 2026-02-01
   python tools/replay_v31.py ... --preset v3         # 原版開關（只看 BTC、不全平），10 格 × 10%
   python tools/replay_v31.py ... --preset v3-live    # 原版實盤設定：不限檔數 × 20%
   python tools/replay_v31.py ... --preset v3.1-live  # 原版倉位＋新開關
