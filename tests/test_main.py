@@ -192,3 +192,85 @@ def test_drain_shadow_waits_then_gives_up():
     assert main._drain_shadow(timeout=0.3) is False
     gate.set()
     main._SHADOW_Q.join()
+
+
+# ---------- v3.1：持倉上限、BTC 且寬度開關、開關關掉就全平（docs/shotgun-v3.1-gate.md） ----------
+
+def _ms(text):
+    return int(pd.Timestamp(text).value // 1_000_000)
+
+
+def test_handle_kline_passes_max_positions():
+    live, pm = MagicMock(), MagicMock()
+    pm.get_open_positions_symbols.return_value = []
+    live.on_closed_kline.return_value = "BUY"
+    cfg = {"NOTIONAL_PCT": 0.10, "DISASTER_STOP_PCT": 0.2, "MAX_POSITIONS": 10}
+    main.handle_kline(_msg("AAAUSDT", 0, c=2.0), live, pm, cfg)
+    assert pm.open_notional.call_args.args[2:] == (pd.Timestamp(3_600_000, unit="ms"), 0.10, 0.2)
+    assert pm.open_notional.call_args.kwargs["max_positions"] == 10
+
+
+def test_enforce_gate_closes_everything_when_gate_is_off():
+    live, pm, notif = MagicMock(), MagicMock(), MagicMock()
+    live.gate_off_reason.return_value = "breadth"
+    live.breadth_on = 0.5
+    live.price_for.side_effect = {"AAAUSDT": 2.0, "BBBUSDT": None}.get
+    pm.get_open_positions_symbols.return_value = ["AAAUSDT", "BBBUSDT"]
+    pm.close_all.return_value = ["AAAUSDT", "BBBUSDT"]
+    now = pd.Timestamp("2026-01-02 05:00:01")
+    assert main.enforce_gate(live, pm, notif, now) == ["AAAUSDT", "BBBUSDT"]
+    prices, ts, reason = pm.close_all.call_args.args
+    assert prices == {"AAAUSDT": 2.0} and ts == now and reason == "GATE_OFF_BREADTH"
+    assert live.gate_off_reason.call_args.args == (_ms("2026-01-02 05:00:01"),)
+    assert "全部平倉 2 檔" in notif.send_heartbeat_notification.call_args.kwargs["message"]
+
+
+def test_enforce_gate_keeps_positions_when_gate_on_or_data_missing():
+    live, pm, notif = MagicMock(), MagicMock(), MagicMock()
+    live.gate_off_reason.return_value = None
+    pm.get_open_positions_symbols.return_value = ["AAAUSDT"]
+    assert main.enforce_gate(live, pm, notif, pd.Timestamp("2026-01-02 05:00")) == []
+    pm.close_all.assert_not_called()
+    notif.send_heartbeat_notification.assert_not_called()
+
+
+def test_refresh_breadth_updates_base_only_at_new_4h_closes():
+    live = MagicMock()
+    live.breadth_smas = {}
+    live.breadth_base_ms = _ms("2026-01-02 04:00")
+    main.refresh_breadth(live, pd.Timestamp("2026-01-02 05:00:01"))
+    live.refresh_breadth_base.assert_not_called()                                   # 05:00 不是 4h 收盤
+    live.refresh_breadth.assert_called_once_with(_ms("2026-01-02 05:00:01"))
+    main.refresh_breadth(live, pd.Timestamp("2026-01-02 08:00:01"))
+    live.refresh_breadth_base.assert_called_once_with(_ms("2026-01-02 08:00"))
+    live.refresh_breadth_base.reset_mock()
+    live.breadth_base_ms = None                                                     # 啟動或上次失敗 → 補算最近一根 4h
+    main.refresh_breadth(live, pd.Timestamp("2026-01-02 13:30"))
+    live.refresh_breadth_base.assert_called_once_with(_ms("2026-01-02 12:00"))
+
+
+def test_report_gate_notifies_only_on_change():
+    live, notif = MagicMock(), MagicMock()
+    live.days = {}
+    live.breadth_on = 0.5
+    live.breadth_now.return_value = 0.42
+    live.gate_state.return_value = "off"
+    now = pd.Timestamp("2026-01-02 05:00")
+    assert main.report_gate(live, notif, now, "on") == "off"
+    message = notif.send_heartbeat_notification.call_args.kwargs["message"]
+    assert "OFF" in message and "42%" in message
+    notif.reset_mock()
+    assert main.report_gate(live, notif, now, "off") == "off"
+    notif.send_heartbeat_notification.assert_not_called()
+
+
+def test_hourly_gate_refreshes_then_reports_then_enforces():
+    live, pm, notif, order = MagicMock(), MagicMock(), MagicMock(), []
+    live.days, live.breadth_on, live.breadth_smas, live.breadth_base_ms = {}, 0.5, {}, _ms("2026-01-02 04:00")
+    live.refresh_breadth.side_effect = lambda now_ms: order.append("refresh") or 0.4
+    live.gate_state.side_effect = lambda now_ms: order.append("report") or "off"
+    live.breadth_now.return_value = 0.4
+    live.gate_off_reason.side_effect = lambda now_ms: order.append("enforce") or "breadth"
+    pm.get_open_positions_symbols.return_value = []
+    assert main.hourly_gate(live, pm, notif, pd.Timestamp("2026-01-02 05:00:01"), "on") == "off"
+    assert order == ["refresh", "report", "enforce"]

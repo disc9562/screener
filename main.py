@@ -15,8 +15,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 from config import (
     get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET,
     USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET,
-    NOTIONAL_PCT, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, EQUITY_LIKE_BASES, POSITIONS_CSV_V3,
-    SHADOW_LISTS_CSV, SHADOW_ENTRIES_CSV, RS_MODE, MIN_DAILY_QUOTE_VOL,
+    NOTIONAL_PCT, MAX_POSITIONS, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, EQUITY_LIKE_BASES, POSITIONS_CSV_V3,
+    SHADOW_LISTS_CSV, SHADOW_ENTRIES_CSV, RS_MODE, MIN_DAILY_QUOTE_VOL, BREADTH_ON, BREADTH_MIN_DAILY_QV,
 )
 from data.fetcher import CryptoFetcher
 from strategy.shotgun_v3_live import ShotgunV3Live
@@ -149,9 +149,61 @@ def handle_kline(message, live, position_manager, cfg):
     if action == "SELL":
         position_manager.close_by_signal(symbol, close, ts, "CROSS_10_20")
     elif action == "BUY":
-        opened = position_manager.open_notional(symbol, close, ts, cfg["NOTIONAL_PCT"], cfg["DISASTER_STOP_PCT"])
+        opened = position_manager.open_notional(symbol, close, ts, cfg["NOTIONAL_PCT"], cfg["DISASTER_STOP_PCT"],
+                                                max_positions=cfg.get("MAX_POSITIONS"))
         _start_shadow(lambda: _entry_job(live, symbol, open_ms, ts, close, opened))   # 影子記錄排背景，不拖主迴圈
     return action
+
+
+def refresh_breadth(live, now):
+    """每小時：基準不是最近一根 4h 收盤算的（每 4 小時一次；啟動或上次失敗時補算；00:00 換日已算過就跳過）就先更新，
+    再用全市場價格更新寬度讀數。"""
+    hour = now.floor("h")
+    last_4h_ms = int((hour - pd.Timedelta(hours=hour.hour % 4)).value // 1_000_000)
+    if live.breadth_base_ms is None or live.breadth_base_ms < last_4h_ms:
+        live.refresh_breadth_base(last_4h_ms)
+    value = live.refresh_breadth(int(now.value // 1_000_000))
+    logging.info(f"Breadth {hour}: {value if value is not None else 'unavailable'} "
+                 f"({len(live.breadth_smas)} liquid symbols, base {pd.Timestamp(live.breadth_base_ms or 0, unit='ms')})")
+    return value
+
+
+def report_gate(live, notification_service, now, previous):
+    """開關狀態（on／off／unknown）改變時記 log、發 Discord；回傳目前狀態。"""
+    now_ms = int(now.value // 1_000_000)
+    state = live.gate_state(now_ms)
+    if state != previous:
+        info = live.days.get(now.date())
+        btc = "?" if info is None else ("EMA200 之上" if info[1] else "EMA200 之下")
+        b = live.breadth_now(now_ms)
+        detail = f"BTC 日線 {btc}，寬度 {'?' if b is None else f'{b:.0%}'}（門檻 {live.breadth_on:.0%}）"
+        label = {"on": "ON：可開新倉", "off": "OFF：不開新倉、持倉全平", "unknown": "資料不足：暫停開新倉"}[state]
+        logging.info(f"Gate {previous} -> {state}: {detail}")
+        notification_service.send_heartbeat_notification(message=f"大盤開關 {label}｜{detail}")
+    return state
+
+
+def hourly_gate(live, position_manager, notification_service, now, previous):
+    """整點：更新寬度 → 報告開關變化 → 開關確定關掉就全平。回傳目前開關狀態。"""
+    refresh_breadth(live, now)
+    state = report_gate(live, notification_service, now, previous)
+    enforce_gate(live, position_manager, notification_service, now)
+    return state
+
+
+def enforce_gate(live, position_manager, notification_service, now):
+    """開關確定關掉（BTC 日線跌破 EMA200，或寬度 < 門檻）→ 全部持倉市價平倉。資料缺漏不算關掉。"""
+    reason = live.gate_off_reason(int(now.value // 1_000_000))
+    open_symbols = position_manager.get_open_positions_symbols()
+    if reason is None or not open_symbols:
+        return []
+    prices = {s: live.price_for(s) for s in open_symbols}
+    closed = position_manager.close_all({s: p for s, p in prices.items() if p is not None}, now, f"GATE_OFF_{reason.upper()}")
+    logging.info(f"Gate off ({reason}): closed {closed}")
+    notification_service.send_heartbeat_notification(
+        message=f"⚠️ 大盤開關關閉（{'BTC 日線跌破 EMA200' if reason == 'btc' else f'寬度 < {live.breadth_on:.0%}'}），"
+                f"全部平倉 {len(closed)} 檔：{', '.join(closed)}")
+    return closed
 
 
 def bootstrap(live, position_manager, now):
@@ -221,27 +273,33 @@ def run_app(args):
         "volume_on": webhook_on, "volume_off": webhook_off,
         "general_targets": strategy_config.get("DISCORD_WEBHOOK_URL_GENERAL_TARGETS"),
     })
-    cfg = {"NOTIONAL_PCT": NOTIONAL_PCT, "DISASTER_STOP_PCT": DISASTER_STOP_PCT}
+    cfg = {"NOTIONAL_PCT": NOTIONAL_PCT, "DISASTER_STOP_PCT": DISASTER_STOP_PCT, "MAX_POSITIONS": MAX_POSITIONS}
     position_manager = PositionManager(notification_service, strategy_config, POSITIONS_CSV_V3,
                                        order_execution_service=_init_order_execution_service())
     live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES,
-                         shadow_fetcher=CryptoFetcher(), rs_mode=RS_MODE, min_daily_quote_vol=MIN_DAILY_QUOTE_VOL)
+                         shadow_fetcher=CryptoFetcher(), rs_mode=RS_MODE, min_daily_quote_vol=MIN_DAILY_QUOTE_VOL,
+                         breadth_on=BREADTH_ON, breadth_min_daily_qv=BREADTH_MIN_DAILY_QV)
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
     subscribed, ok = bootstrap(live, position_manager, now)
     cutoff = next_cutoff(now) if ok else now.normalize()      # 今日名單沒算成 → 進迴圈後立刻重試
     retry_at = now
+    gate = hourly_gate(live, position_manager, notification_service, now, previous=None)
+    breadth_hour = now.floor("h")
     notification_service.send_list_change_notification(added=set(subscribed), removed=set(), webhook_type="general_targets")
     ws = WebSocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET, notification_service=notification_service)
     ws.start(symbols=sorted(subscribed), interval='1h')
     try:
         while True:
+            message = ws.get_message(block=True, timeout=1)
             now = pd.Timestamp.now(tz="UTC").tz_localize(None)
             if now >= cutoff and now >= retry_at:
                 if rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
                     cutoff = next_cutoff(now)
                 else:
                     retry_at = now + REBALANCE_RETRY
-            message = ws.get_message(block=True, timeout=1)
+            if now.floor("h") > breadth_hour:                  # 先更新寬度與開關，再處理這個整點收完的 K 棒
+                gate = hourly_gate(live, position_manager, notification_service, now, gate)
+                breadth_hour = now.floor("h")
             if message:
                 try:
                     handle_kline(message, live, position_manager, cfg)

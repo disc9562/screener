@@ -142,6 +142,28 @@ class CryptoFetcher(BaseFetcher):
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
            retry=retry_if_exception_type((BinanceAPIException, requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+           retry_error_callback=_give_up({}))
+    def fetch_prices(self):
+        """所有永續合約的最新價格 {symbol: price}，一次請求（權重 2）；失敗回傳 {}。"""
+        if not self.client:
+            return {}
+        try:
+            rows = self._request(2, self.client.futures_symbol_ticker)
+            return {r["symbol"]: float(r["price"]) for r in rows}
+        except BinanceAPIException as e:
+            if _rate_limited(e):
+                logger.warning(f"Rate limit hit for prices (HTTP {e.status_code}). Pausing all requests {_retry_after(e)}s, then retrying...")
+                raise
+            logger.error(f"Error fetching prices: {e}")
+            return {}
+        except _NETWORK_ERRORS:
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching prices: {e}")
+            return {}
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
+           retry=retry_if_exception_type((BinanceAPIException, requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
            retry_error_callback=_give_up([]))
     def get_all_symbols(self):
         """USDT-margined perpetuals that are currently TRADING (excludes delisted/settled contracts and quarterlies)."""

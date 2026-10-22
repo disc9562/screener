@@ -1,5 +1,10 @@
 # Shotgun v3 運行手冊
 
+> v3.1（分支 `proposal/btc-breadth-gate`）加了持倉上限、「BTC 且寬度」開關與開關關掉就全平，見 `docs/shotgun-v3.1-gate.md`。
+> 新的 `.env` 參數：`NOTIONAL_PCT`（預設改為 0.10）、`MAX_POSITIONS`（10）、`BREADTH_ON`（0.5）、`BREADTH_MIN_DAILY_QV`（5000000）。
+> testnet 每日多查：每小時 log 有 `Breadth <時間>: <讀數> (<N> liquid symbols, base <4h 收盤>)`；
+> 開關改變時 Discord 有「大盤開關 ON／OFF／資料不足」；全平後交易所端部位與止損單都要清空。
+
 ## 上線前
 1. 對帳：`core_backtests\venv\Scripts\python.exe tools/replay_parity.py --research-root C:\Users\jay\Desktop\core_backtests` → 必須 PASS。
 2. `.env`：`USE_TESTNET=true`、`BINANCE_TESTNET_API_KEY/SECRET`、Discord webhooks；可調 `NOTIONAL_PCT`（預設 0.04）、`DISASTER_STOP_PCT`（0.20）、`EXCLUDE_SYMBOLS`（BTCDOMUSDT）。

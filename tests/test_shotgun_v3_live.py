@@ -35,6 +35,11 @@ def _live(fetcher, now_ms=T0):
     return ShotgunV3Live(fetcher, exclude_symbols=["BTCDOMUSDT"], exclude_bases={"TSLA"}, now_ms=lambda: now_ms)
 
 
+def _breadth_on(live, at_ms, value=0.8):
+    """模擬整點剛更新過的寬度讀數（v3.1：進場要 BTC 多頭且寬度 ≥ 門檻）。"""
+    live.breadth_value, live.breadth_ms, live.breadth_base_ms = value, at_ms, at_ms
+
+
 def test_daily_rebalance_excludes_and_ranks():
     f = FakeFetcher()
     top, bull = _live(f).daily_rebalance(pd.Timestamp(T0, unit="ms"))
@@ -57,6 +62,7 @@ def test_on_closed_kline_buy_then_sell():
     f.k1h["AAAUSDT"] = _rows(up, T0 - 1500 * H, H)
     live = _live(f, now_ms=T0)
     live.days[pd.Timestamp(T0, unit="ms").date()] = (frozenset({"AAAUSDT"}), True)
+    _breadth_on(live, T0)
     assert live.warmup("AAAUSDT")
     assert live.on_closed_kline("AAAUSDT", T0, float(up[-1] * 1.001), has_position=False) == "BUY"
     act, px, t = None, float(up[-1]), T0
@@ -102,6 +108,7 @@ def test_failed_warmup_is_retried_on_next_kline():
     assert not live.warmup("AAAUSDT")
     f.k1h["AAAUSDT"] = _rows(up, T0 - 1499 * H, H)              # 恢復，且已含剛收完的 T0 那根
     live.days[pd.Timestamp(T0, unit="ms").date()] = (frozenset({"AAAUSDT"}), True)
+    _breadth_on(live, T0 + H)
     assert live.on_closed_kline("AAAUSDT", T0, float(up[-1]), has_position=False) == "BUY"
     assert live.states["AAAUSDT"].last_open_ms == T0
 
@@ -201,4 +208,96 @@ def test_rebalance_filters_low_liquidity_and_1000_prefix_and_stale():
                          now_ms=lambda: T0, rs_mode="v2", min_daily_quote_vol=1_000_000.0)
     top, _ = live.daily_rebalance(pd.Timestamp(T0, unit="ms"))
     assert top == ["AAAUSDT"]
+
+
+# ---------- v3.1：BTC 且寬度開關（docs/shotgun-v3.1-gate.md） ----------
+
+class BreadthFetcher(FakeFetcher):
+    """4h 帶成交額（每根 500 萬 U → 每天 3,000 萬，可交易）；AAA 漲、BBB 跌、BTC 持平。"""
+
+    def __init__(self, prices=None):
+        super().__init__()
+        self.prices = prices if prices is not None else {}
+
+    def fetch_klines(self, symbol, interval, limit):
+        if interval == "4h":
+            self.calls.append((symbol, interval, limit))
+            trend = {"AAAUSDT": 0.002, "BBBUSDT": -0.002}.get(symbol, 0.0)
+            closes = 100 * np.exp(np.cumsum(np.full(300, trend)))
+            return [r + [5_000_000.0] for r in _rows(closes, T0 - 300 * 4 * H, 4 * H)][-limit:]
+        return super().fetch_klines(symbol, interval, limit)
+
+    def fetch_prices(self):
+        return dict(self.prices)
+
+
+def test_daily_rebalance_sets_breadth_base_and_reading():
+    live = _live(BreadthFetcher())
+    live.daily_rebalance(pd.Timestamp(T0, unit="ms"))
+    assert set(live.breadth_smas) == {"AAAUSDT", "BBBUSDT", "BTCUSDT"}           # 排除的幣不算
+    assert live.breadth_base_ms == T0 and live.breadth_ms == T0
+    assert np.isclose(live.breadth_value, 1 / 3)                                   # 只有上漲的 AAA 在 20 日均線之上
+
+
+def _warm_aaa():
+    f = BreadthFetcher()
+    up = 100 * np.exp(np.cumsum(np.full(1500, 0.001)))
+    f.k1h["AAAUSDT"] = _rows(up, T0 - 1500 * H, H)
+    live = _live(f, now_ms=T0)
+    assert live.warmup("AAAUSDT")
+    return live, float(up[-1] * 1.001)
+
+
+def test_entry_needs_btc_and_breadth():
+    for value, at_ms, bull, want in ((0.8, T0, True, "BUY"),           # 兩個都 ON
+                                     (0.3, T0, True, None),            # 寬度不足
+                                     (0.8, T0 - 3 * H, True, None),    # 讀數超過 2 小時 → 未知 → 不進新倉
+                                     (0.8, T0, False, None)):          # BTC 日線跌破 EMA200
+        live, px = _warm_aaa()
+        live.days[pd.Timestamp(T0, unit="ms").date()] = (frozenset({"AAAUSDT"}), bull)
+        _breadth_on(live, at_ms, value)
+        assert live.on_closed_kline("AAAUSDT", T0, px, has_position=False) == want
+
+
+def test_refresh_breadth_uses_prices_and_keeps_last_reading_on_failure():
+    f = BreadthFetcher(prices={"AAAUSDT": 101.0, "BBBUSDT": 99.0})
+    live = _live(f)
+    live.breadth_smas, live.breadth_base_ms = {"AAAUSDT": 100.0, "BBBUSDT": 100.0}, T0
+    assert live.refresh_breadth(T0 + H) == 0.5 and live.breadth_ms == T0 + H
+    f.prices = {}                                                                   # 價格抓不到
+    assert live.refresh_breadth(T0 + 2 * H) is None
+    assert live.breadth_value == 0.5 and live.breadth_ms == T0 + H                 # 保留舊讀數
+    assert live.breadth_now(T0 + 3 * H) == 0.5 and live.breadth_now(T0 + 3 * H + 1) is None   # 2 小時後過期
+
+
+def test_refresh_breadth_base_keeps_old_when_4h_not_fresh():
+    f = BreadthFetcher()
+    live = _live(f)
+    live.daily_rebalance(pd.Timestamp(T0, unit="ms"))
+    assert live.refresh_breadth_base(T0) and ("AAAUSDT", "4h", 130) in f.calls
+    old = dict(live.breadth_smas)
+    assert not live.refresh_breadth_base(T0 + 4 * H)                               # K 線還停在 T0：全部不新鮮
+    assert live.breadth_smas == old and live.breadth_base_ms == T0
+
+
+def test_gate_off_reason_and_state():
+    live = _live(FakeFetcher())
+    today = pd.Timestamp(T0, unit="ms").date()
+    live.days[today] = (frozenset(), False)
+    assert live.gate_off_reason(T0) == "btc" and live.gate_state(T0) == "off"
+    live.days[today] = (frozenset(), True)
+    _breadth_on(live, T0, 0.3)
+    assert live.gate_off_reason(T0) == "breadth" and live.gate_state(T0) == "off"
+    _breadth_on(live, T0, 0.6)
+    assert live.gate_off_reason(T0) is None and live.gate_state(T0) == "on"
+    assert live.gate_off_reason(T0 + 3 * H) is None                                # 讀數過期：不據此平倉
+    assert live.gate_state(T0 + 3 * H) == "unknown"                                 # 也不開新倉
+
+
+def test_price_for_prefers_latest_prices_then_last_close():
+    live, _ = _warm_aaa()
+    assert live.price_for("AAAUSDT") == live.states["AAAUSDT"].closes[-1]
+    live.fetcher.prices = {"AAAUSDT": 123.0}
+    live.refresh_breadth(T0)
+    assert live.price_for("AAAUSDT") == 123.0 and live.price_for("ZZZUSDT") is None
 

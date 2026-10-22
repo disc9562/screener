@@ -223,11 +223,23 @@ class PositionManager:
         realized = float(pd.to_numeric(closed['pnl'], errors='coerce').fillna(0).sum()) if len(closed) else 0.0
         return float(self.strategy_config.get('TOTAL_CAPITAL')) + realized
 
-    def open_notional(self, symbol, price, timestamp, notional_pct, disaster_stop_pct) -> bool:
-        if symbol in self.get_open_positions_symbols():
+    def sizing_equity(self) -> float:
+        """下單用的權益：已實現權益再扣掉持倉的浮動虧損（浮盈不加碼）。持倉列的 pnl 由 update_positions 每小時更新。"""
+        if self.positions_df.empty:
+            return self.paper_equity()
+        open_rows = self.positions_df[self.positions_df['status'] == 'OPEN']
+        floating = float(pd.to_numeric(open_rows['pnl'], errors='coerce').fillna(0).sum()) if len(open_rows) else 0.0
+        return self.paper_equity() + min(0.0, floating)
+
+    def open_notional(self, symbol, price, timestamp, notional_pct, disaster_stop_pct, max_positions=None) -> bool:
+        open_symbols = self.get_open_positions_symbols()
+        if symbol in open_symbols:
             logger.info(f"Position for {symbol} is already open. Ignoring BUY.")
             return False
-        units = self.paper_equity() * notional_pct / price
+        if max_positions is not None and len(open_symbols) >= max_positions:
+            logger.info(f"{len(open_symbols)} positions open (max {max_positions}). Ignoring BUY for {symbol}.")
+            return False
+        units = self.sizing_equity() * notional_pct / price
         stop = price * (1 - disaster_stop_pct)
         row = {'symbol': symbol, 'status': 'OPEN', 'entry_price': price, 'stop_loss': stop,
                'take_profit': float('nan'), 'units': units, 'entry_timestamp': timestamp,
@@ -294,3 +306,16 @@ class PositionManager:
             symbol=symbol, action="SELL", price=price, units=pos['units'], reason=reason, pnl=pnl,
             is_volume_on=False, testnet_orders=orders)
         return True
+
+    def close_all(self, prices, timestamp, reason) -> list:
+        """全部持倉市價平倉（大盤開關關掉時）。prices：{symbol: 紙上平倉價}；缺價格的幣用進場價記帳並警示。"""
+        closed = []
+        for symbol in self.get_open_positions_symbols():
+            price = prices.get(symbol)
+            if price is None:
+                row = self.positions_df[(self.positions_df['symbol'] == symbol) & (self.positions_df['status'] == 'OPEN')].iloc[0]
+                price = float(row['entry_price'])
+                logger.warning(f"No price for {symbol} at {reason}; paper exit booked at entry price {price}")
+            if self.close_by_signal(symbol, price, timestamp, reason):
+                closed.append(symbol)
+        return closed

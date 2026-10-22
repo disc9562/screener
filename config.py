@@ -87,10 +87,15 @@ def get_strategy_config():
         "TEST_COIN_SUBSET": TEST_COIN_SUBSET,
     }
 
-# --- Shotgun v3（docs/shotgun-v3-bot-spec.md）---
-# NOTIONAL_PCT = 0.20 搭配 DISASTER_STOP_PCT = 0.20 => 單筆打到嚴格止損時最多損失總權益 4%（隨總權益複利縮放）
-NOTIONAL_PCT = float(os.getenv("NOTIONAL_PCT", "0.20"))
+# --- Shotgun v3（docs/shotgun-v3-bot-spec.md；v3.1 開關與倉位見 docs/shotgun-v3.1-gate.md）---
+# 每筆名目 = 下單權益 × NOTIONAL_PCT，最多 MAX_POSITIONS 檔 → 總名目最多 100%。
+# 想要更小回撤：NOTIONAL_PCT=0.05、MAX_POSITIONS=20。原本 0.20 且不限檔數，研究中複利三年剩 0.34 倍。
+NOTIONAL_PCT = float(os.getenv("NOTIONAL_PCT", "0.10"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
 DISASTER_STOP_PCT = float(os.getenv("DISASTER_STOP_PCT", "0.20"))
+# 新倉開關：BTC 日線 > EMA200 且 寬度 ≥ BREADTH_ON；任一確定關掉 → 全部平倉
+BREADTH_ON = float(os.getenv("BREADTH_ON", "0.5"))
+BREADTH_MIN_DAILY_QV = float(os.getenv("BREADTH_MIN_DAILY_QV", "5000000"))
 RS_MODE = os.getenv("RS_MODE", "alligator")
 MIN_DAILY_QUOTE_VOL = float(os.getenv("MIN_DAILY_QUOTE_VOL", "1000000"))
 EXCLUDE_SYMBOLS = [s for s in os.getenv("EXCLUDE_SYMBOLS", "BTCDOMUSDT").split(",") if s]
