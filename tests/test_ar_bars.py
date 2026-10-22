@@ -45,3 +45,7 @@ def test_rma_last_matches_and_short_input():
     assert math.isclose(rma_last(c[:300], 233), V.rma_seeded(c[:300], 233)[-1], rel_tol=1e-10)
     assert math.isclose(rma_last(c[:233], 233), c[:233].mean(), rel_tol=1e-12)
     assert math.isnan(rma_last(c[:100], 233))
+
+
+def test_resample_empty_returns_empty():
+    assert len(resample(_bars5m(0), 60)) == 0

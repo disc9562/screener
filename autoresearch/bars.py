@@ -28,6 +28,8 @@ class Bars:
 
 
 def resample(b: Bars, minutes: int) -> Bars:
+    if len(b) == 0:
+        return b
     step = minutes * MIN_MS
     keys = b.t // step * step
     uniq, first = np.unique(keys, return_index=True)
