@@ -1,9 +1,9 @@
 """回測引擎：candidate + 5m 快取 → 交易、每小時 MTM 權益曲線、最大回撤。"""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
-from autoresearch.bars import DAY_MS, HOUR_MS, TF_MINUTES, resample
+from autoresearch.bars import DAY_MS, Bars, HOUR_MS, TF_MINUTES, resample
 from autoresearch.indicators import rma
 from config import TRANSACTION_FEE_PERCENT
 
@@ -80,6 +80,22 @@ def build_daily_gates(cand, bars_4h, btc_1d, start_ms, end_ms):
     return gates
 
 
+def _readonly(b):
+    arrs = [a.copy() for a in (b.t, b.o, b.h, b.l, b.c, b.v, b.qv)]
+    for a in arrs:
+        a.setflags(write=False)
+    return Bars(*arrs)
+
+
+def _prefix(sig, i):
+    out = {}
+    for k, v in sig.items():
+        v = np.asarray(v)[:i + 1]
+        v.setflags(write=False)
+        out[k] = v
+    return out
+
+
 def _pos_int(x):
     return isinstance(x, (int, np.integer)) and not isinstance(x, bool) and x > 0
 
@@ -101,6 +117,8 @@ def prepare(cand, base5m, end_ms):
         b = b.window(0, int(np.searchsorted(b.t + tf_ms, end_ms, "right")))
         if len(b) == 0:
             continue
+        b = _readonly(b)  # 共用的 5m 陣列不能被 candidate 改到
+        mask = rma(b.c, 10) < rma(b.c, 20)  # 在 signals 之前算，鎖死的出場不受影響
         sig = cand.signals(b)
         for key in ("entry", "stop"):
             if not isinstance(sig, dict) or key not in sig:
@@ -109,7 +127,7 @@ def prepare(cand, base5m, end_ms):
                 raise CandidateError(f"signals()[{key!r}] length {len(sig[key])} != {len(b)}")
         p.bars[s] = b
         p.sig[s] = sig
-        p.exit_mask[s] = rma(b.c, 10) < rma(b.c, 20)
+        p.exit_mask[s] = mask
         p.close_1h[s] = resample(raw, 60)
     return p
 
@@ -181,9 +199,9 @@ def simulate(cand, p, gates, r, start_ms, end_ms, exposure_cap=4.0, equity0=10_0
             elif p.exit_mask[s][i]:
                 close(pos, float(b.c[i]), T + tf, "CROSS_10_20")
             else:
-                new = cand.update_stop(p.sig[s], i, pos)
+                new = cand.update_stop(_prefix(p.sig[s], i), i, replace(pos))
                 if new is not None and np.isfinite(new):
-                    pos.stop = max(pos.stop, float(new))
+                    pos.stop = max(pos.stop, min(float(new), float(b.c[i])))
         if eq <= 0:
             bankrupt = True
             break

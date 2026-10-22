@@ -57,19 +57,21 @@ def test_build_daily_gates_window_and_btc_gate():
     seen = []
 
     def score(w, cut):
-        seen.append((len(w), int(w.t[-1]), cut))
         last = w.c[-1]
+        seen.append((len(w), int(w.t[-1]), cut, last))
         return None if last == 7 else last / 100
 
     cand = SimpleNamespace(SELECT_WINDOW_4H=100, TOP_N=1, select_score=score,
-                           btc_gate=lambda c: len(c) != 11)
+                           btc_gate=lambda c: len(c) != 21)
     h4 = 4 * HOUR_MS
     bars_4h = {"B": _bars([100.0] * 400, step=h4), "A": _bars([100.0] * 400, step=h4),
                "C": _bars([50.0] * 50, step=h4), "D": _bars([7.0] * 400, step=h4), "E": _empty()}
-    btc = _bars(np.ones(20), step=DAY_MS)
-    gates = build_daily_gates(cand, bars_4h, btc, 10 * DAY_MS, 12 * DAY_MS)
-    assert gates == {10 * DAY_MS: frozenset({"A"}), 11 * DAY_MS: frozenset()}
-    assert seen and all(n <= 100 and last < cut for n, last, cut in seen)
+    btc = _bars(np.ones(30), step=DAY_MS)
+    gates = build_daily_gates(cand, bars_4h, btc, 20 * DAY_MS, 22 * DAY_MS)
+    assert gates == {20 * DAY_MS: frozenset({"A"}), 21 * DAY_MS: frozenset()}
+    assert all(n <= 100 and last < cut for n, last, cut, _ in seen)
+    full = [(n, last, cut) for n, last, cut, lv in seen if lv == 100]
+    assert len(full) == 2 and all(n == 100 and last == cut - 4 * HOUR_MS for n, last, cut in full)
 
 
 def test_simulate_sizes_by_risk_and_fills_stop():
@@ -89,6 +91,33 @@ def test_stop_only_ratchets_up_from_next_bar():
     cand = _cand(lambda sig, i, pos: {3: 95.0, 4: 80.0}.get(i, pos.stop))
     (t,) = simulate(cand, p, _gate("A"), 0.04, 0, END).trades
     assert (t.exit_px, t.reason, t.exit_ms) == (95, "STOP", 6 * HOUR_MS)
+
+
+def test_update_stop_clamped_to_close():
+    l = [99.0] * N
+    l[4] = 99.5
+    p = _prep({"A": dict(c=[100.0] * N, l=l, entries=[2], stop=50.0)})
+    cand = _cand(lambda sig, i, pos: 110.0 if i == 3 else pos.stop)
+    (t,) = simulate(cand, p, _gate("A"), 0.04, 0, END).trades
+    assert (t.exit_px, t.reason) == (100, "STOP")
+
+
+def test_update_stop_cannot_lower_stop_or_see_future():
+    l = [99.0] * N
+    l[5] = 89
+    p = _prep({"A": dict(c=[100.0] * N, l=l, entries=[2], stop=90.0)})
+    lens = []
+
+    def upd(sig, i, pos):
+        lens.extend((i, len(v)) for v in sig.values())
+        with pytest.raises(IndexError):
+            sig["entry"][i + 1]
+        pos.stop = 10.0
+        return pos.stop
+
+    (t,) = simulate(_cand(upd), p, _gate("A"), 0.04, 0, END).trades
+    assert (t.exit_px, t.reason) == (90, "STOP")
+    assert lens and all(n == i + 1 for i, n in lens)
 
 
 def test_exit_cross_and_end_close():
@@ -151,3 +180,16 @@ def test_prepare_rejects_bad_candidate():
     for over in bad:
         with pytest.raises(CandidateError):
             prepare(SimpleNamespace(**{**fine, **over}), base, DAY_MS)
+
+
+def test_prepare_gives_candidate_readonly_bars():
+    def sneaky(b):
+        b.c[0] = 0
+        return {}
+
+    base = {"A": _bars(np.full(288, 100.0), step=300_000)}
+    cand = SimpleNamespace(ENTRY_TF="5m", SELECT_WINDOW_4H=10, TOP_N=1, select_score=len, btc_gate=len,
+                           update_stop=len, signals=sneaky)
+    with pytest.raises((ValueError, CandidateError)):
+        prepare(cand, base, DAY_MS)
+    assert base["A"].c[0] == 100.0
