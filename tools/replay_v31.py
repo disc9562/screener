@@ -36,7 +36,7 @@ import main  # noqa: E402
 for _h in list(logging.getLogger().handlers):              # main 匯入時會掛 application.log；重播不寫實盤日誌
     logging.getLogger().removeHandler(_h)
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-from config import EQUITY_LIKE_BASES, EXCLUDE_SYMBOLS, MIN_DAILY_QUOTE_VOL, RS_MODE  # noqa: E402
+from config import EXCLUDE_SYMBOLS, MIN_DAILY_QUOTE_VOL, NON_CRYPTO_BASES, RS_MODE  # noqa: E402
 from services.position_manager import PositionManager  # noqa: E402
 from strategy import shotgun_v3 as V  # noqa: E402
 from strategy.shotgun_v3_live import ShotgunV3Live  # noqa: E402
@@ -134,7 +134,7 @@ def replay(data_dir, start, end, out_dir, breadth_on, kill, max_positions, notio
     pm = PositionManager(notif, {"TOTAL_CAPITAL": capital, "TRANSACTION_FEE_PERCENT": fee},
                          str(Path(tempfile.mkdtemp(prefix="replay_v31_")) / "positions.csv"))
     pm._save_positions = lambda: None                         # 重播只在記憶體記帳（每筆進出場寫 CSV 在 Windows 會撞檔案鎖）
-    live = ShotgunV3Live(fetcher, exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES,
+    live = ShotgunV3Live(fetcher, exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=NON_CRYPTO_BASES,
                          now_ms=lambda: fetcher.now, fetch_workers=1, rs_mode=RS_MODE,
                          min_daily_quote_vol=MIN_DAILY_QUOTE_VOL, breadth_on=breadth_on)
     main._start_shadow = lambda fn: None                      # 影子記錄不在重播範圍

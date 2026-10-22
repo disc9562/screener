@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 from config import (
     get_strategy_config, BINANCE_API_KEY, BINANCE_API_SECRET,
     USE_TESTNET, BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET,
-    NOTIONAL_PCT, MAX_POSITIONS, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, EQUITY_LIKE_BASES, POSITIONS_CSV_V3,
+    NOTIONAL_PCT, MAX_POSITIONS, DISASTER_STOP_PCT, EXCLUDE_SYMBOLS, NON_CRYPTO_BASES, POSITIONS_CSV_V3,
     SHADOW_LISTS_CSV, SHADOW_ENTRIES_CSV, RS_MODE, MIN_DAILY_QUOTE_VOL, BREADTH_ON, BREADTH_MIN_DAILY_QV,
 )
 from data.fetcher import CryptoFetcher
@@ -322,7 +322,7 @@ def run_app(args):
     cfg = {"NOTIONAL_PCT": NOTIONAL_PCT, "DISASTER_STOP_PCT": DISASTER_STOP_PCT, "MAX_POSITIONS": MAX_POSITIONS}
     position_manager = PositionManager(notification_service, strategy_config, POSITIONS_CSV_V3,
                                        order_execution_service=_init_order_execution_service())
-    live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=EQUITY_LIKE_BASES,
+    live = ShotgunV3Live(CryptoFetcher(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=NON_CRYPTO_BASES,
                          shadow_fetcher=CryptoFetcher(), rs_mode=RS_MODE, min_daily_quote_vol=MIN_DAILY_QUOTE_VOL,
                          breadth_on=BREADTH_ON, breadth_min_daily_qv=BREADTH_MIN_DAILY_QV)
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)

@@ -67,6 +67,18 @@ v3 管線用逐小時持倉模擬重跑，期間是 2023-10 ~ 2025-01（樣本�
 - 依 v3 慣例那根屬前一日名單，所以可能買進一個剛被取消訂閱的幣。之後收不到它的 K 棒，就無法 SMMA 出場，只剩交易所端 −20% 災難止損，最久要到隔天換日才重新訂閱。
 - 重播 v3.1 六段時，每段都發生：每半年約 19 ~ 48 小時有持倉沒被監控。
 - 修正：`main.subscribe_open_positions` 在每批 K 棒處理完後，把沒訂閱的持倉補訂閱（狀態已在那根處理時從 REST 重建）。
+
+### 順便修掉的原版問題：母體排錯幣
+
+- 原版用 `EQUITY_LIKE_BASES`（股票／商品代號清單）排除代幣化股票，但股票代號和幣撞名：CVXUSDT（Convex，撞雪佛龍）、TUSDT（Threshold，撞 AT&T）、FUSDT（SynFutures，撞福特）、1000CATUSDT（撞 Caterpillar）都被排除。
+  重播比對時，2026-08 有好幾天 CVX 排進研究的名單卻不在 bot 名單。
+- 指數合約 ALLUSDT 反而沒被排除，可能進名單。
+- 其實 Binance 的股票／商品合約是 `TRADIFI_PERPETUAL`，原本只取 `PERPETUAL` 時就不會進來；指數合約的 `underlyingType` 是 `INDEX`。
+- 修正：
+  - `get_all_symbols()` 只取 `underlyingType == "COIN"`。
+  - 實盤改用 `NON_CRYPTO_BASES`（穩定幣、黃金代幣）排除。
+  - 2026-10-22 實測母體 519 檔，和研究資料相同。
+  - `EQUITY_LIKE_BASES` 留給研究工具。
 - 開關關掉時的全平在同一個整點執行，紙上平倉價用剛抓到的全市場價格；交易所端走原本的 `close_position`（reduceOnly 市價單 + 撤止損）。
 - 開關狀態（on／off／unknown）改變時，Discord 會收到「大盤開關 …｜BTC 日線 …，寬度 …」；全平時另發「大盤開關關閉…全部平倉 N 檔」。
 

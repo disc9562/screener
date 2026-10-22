@@ -294,6 +294,18 @@ def test_gate_off_reason_and_state():
     assert live.gate_state(T0 + 3 * H) == "unknown"                                 # 也不開新倉
 
 
+def test_universe_keeps_coins_that_share_a_stock_ticker():
+    """實盤母體用 NON_CRYPTO_BASES：CVX（Convex）、T（Threshold）、F、1000CAT 是幣，不能因為和股票代號撞名被排除。"""
+    from config import EXCLUDE_SYMBOLS, NON_CRYPTO_BASES
+
+    class Universe(FakeFetcher):
+        def get_all_symbols(self):
+            return ["CVXUSDT", "TUSDT", "FUSDT", "1000CATUSDT", "USDCUSDT", "PAXGUSDT", "BTCDOMUSDT", "BTCUSDT"]
+
+    live = ShotgunV3Live(Universe(), exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=NON_CRYPTO_BASES, now_ms=lambda: T0)
+    assert live._universe() == ["CVXUSDT", "TUSDT", "FUSDT", "1000CATUSDT", "BTCUSDT"]
+
+
 def test_price_for_prefers_latest_prices_then_last_close():
     live, _ = _warm_aaa()
     assert live.price_for("AAAUSDT") == live.states["AAAUSDT"].closes[-1]
