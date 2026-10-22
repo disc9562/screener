@@ -13,6 +13,8 @@ main.handle_kline、PositionManager（紙上模式）。順序照 main.run_app�
   python tools/replay_v31.py --data ../research/cache_2025 --start 2025-08-01 --end 2026-02-01
   python tools/replay_v31.py ... --preset v3         # 原版開關（只看 BTC、不全平），10 格 × 10%
   python tools/replay_v31.py ... --preset v3-live    # 原版實盤設定：不限檔數 × 20%
+  python tools/replay_v31.py ... --preset v3.1-live  # 原版倉位＋新開關
+下單權益一律用本版的 sizing_equity（已實現＋浮虧）；原版只用已實現權益，研究模擬兩者在不限檔數時差 1%（8.8 vs 8.9 倍）。
 輸出 <out>/trades.csv（每筆進出場）、<out>/equity.csv（逐小時權益），並印出摘要。
 """
 from __future__ import annotations
@@ -47,6 +49,7 @@ PRESETS = {
     "v3.1": dict(breadth_on=0.5, kill=True, max_positions=10, notional=0.10),
     "v3": dict(breadth_on=0.0, kill=False, max_positions=10, notional=0.10),
     "v3-live": dict(breadth_on=0.0, kill=False, max_positions=None, notional=0.20),
+    "v3.1-live": dict(breadth_on=0.5, kill=True, max_positions=None, notional=0.20),   # 原版倉位＋新開關
 }
 
 
@@ -208,8 +211,11 @@ def main_cli():
     ap.add_argument("--preset", choices=list(PRESETS), default="v3.1")
     ap.add_argument("--btc", help="BTC daily json if <data>/btc_1d.json has < 1000 days before --start")
     ap.add_argument("--out", default="data/replay_v31")
+    ap.add_argument("--fee", type=float, default=0.0006,
+                    help="fee per side (default 0.0006 = the bot's TRANSACTION_FEE_PERCENT; the research uses 0.001 incl. slippage)")
     a = ap.parse_args()
-    replay(a.data, a.start, a.end, Path(a.out) / f"{a.preset}_{a.start}_{a.end}", btc_path=a.btc, **PRESETS[a.preset])
+    name = f"{a.preset}_{a.start}_{a.end}" + ("" if a.fee == 0.0006 else f"_fee{a.fee:g}")
+    replay(a.data, a.start, a.end, Path(a.out) / name, btc_path=a.btc, fee=a.fee, **PRESETS[a.preset])
 
 
 if __name__ == "__main__":
