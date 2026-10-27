@@ -1,11 +1,11 @@
 """回測引擎：candidate + 5m 快取 → 交易、每小時 MTM 權益曲線、最大回撤。"""
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 import numpy as np
 
-from autoresearch.bars import DAY_MS, Bars, HOUR_MS, TF_MINUTES, resample
+from autoresearch.bars import DAY_MS, Bars, HOUR_MS, MIN_MS, TF_MINUTES, resample
 from autoresearch.indicators import rma
-from config import TRANSACTION_FEE_PERCENT
 
 
 class CandidateError(Exception):
@@ -56,22 +56,27 @@ class Prepared:
     close_1h: dict
 
 
-def build_daily_gates(cand, bars_4h, btc_1d, start_ms, end_ms):
+def build_daily_gates(cand, bars_4h, btc_4h, btc_1d, start_ms, end_ms):
+    """每天 cutoff：w 與 btc_w 都是 cutoff 前已收完的最近 SELECT_WINDOW_4H 根 4h（唯讀 view）。"""
     gates = {}
+    bars_4h = {s: _readonly(b) for s, b in bars_4h.items()}
+    btc_4h = _readonly(btc_4h)
     syms = sorted(bars_4h)
     cuts = list(range(start_ms // DAY_MS * DAY_MS, end_ms, DAY_MS))
     ks = {s: np.searchsorted(bars_4h[s].t, cuts, "left") for s in syms}
+    kb = np.searchsorted(btc_4h.t, cuts, "left")
     for j, cut in enumerate(cuts):
         if not cand.btc_gate(btc_1d.c[btc_1d.t < cut]):
             gates[cut] = frozenset()
             continue
+        btc_w = btc_4h.window(max(0, int(kb[j]) - cand.SELECT_WINDOW_4H), int(kb[j]))
         scored = []
         for s in syms:
             k = int(ks[s][j])
             w = bars_4h[s].window(max(0, k - cand.SELECT_WINDOW_4H), k)
             if len(w) == 0:
                 continue
-            sc = cand.select_score(w, cut)
+            sc = cand.select_score(w, cut, btc_w)
             if sc is None or not np.isfinite(sc):
                 continue
             scored.append((-float(sc), s))
@@ -81,10 +86,15 @@ def build_daily_gates(cand, bars_4h, btc_1d, start_ms, end_ms):
 
 
 def _readonly(b):
-    arrs = [a.copy() for a in (b.t, b.o, b.h, b.l, b.c, b.v, b.qv)]
+    """唯讀 view，不複製（guard 擋掉 setflags／flags／base，candidate 拿不回可寫的原陣列）。"""
+    arrs = [a.view() for a in (b.t, b.o, b.h, b.l, b.c, b.v, b.qv)]
     for a in arrs:
         a.setflags(write=False)
     return Bars(*arrs)
+
+
+def _cut5m(b, end_ms):
+    return b.window(0, int(np.searchsorted(b.t + 5 * MIN_MS, end_ms, "right")))
 
 
 def _prefix(sig, i):
@@ -100,7 +110,8 @@ def _pos_int(x):
     return isinstance(x, (int, np.integer)) and not isinstance(x, bool) and x > 0
 
 
-def prepare(cand, base5m, end_ms):
+def prepare(cand, base5m, end_ms, btc5m):
+    """signals(b, aux)：b 是 ENTRY_TF 的 K 線；aux 的 base5m／btc5m 和 b 截在同一個 end_ms，全部唯讀。"""
     tf = getattr(cand, "ENTRY_TF", None)
     if tf not in TF_MINUTES or tf == "1d":
         raise CandidateError(f"bad ENTRY_TF: {tf!r}")
@@ -111,6 +122,7 @@ def prepare(cand, base5m, end_ms):
             raise CandidateError(f"missing function: {name}")
     tf_ms = TF_MINUTES[tf] * 60_000
     p = Prepared(tf_ms, {}, {}, {}, {})
+    btc = _readonly(_cut5m(btc5m, end_ms))
     for s in sorted(base5m):
         raw = base5m[s]
         b = raw if tf == "5m" else resample(raw, TF_MINUTES[tf])
@@ -119,7 +131,7 @@ def prepare(cand, base5m, end_ms):
             continue
         b = _readonly(b)  # 共用的 5m 陣列不能被 candidate 改到
         mask = rma(b.c, 10) < rma(b.c, 20)  # 在 signals 之前算，鎖死的出場不受影響
-        sig = cand.signals(b)
+        sig = cand.signals(b, MappingProxyType({"base5m": _readonly(_cut5m(raw, end_ms)), "btc5m": btc}))
         for key in ("entry", "stop"):
             if not isinstance(sig, dict) or key not in sig:
                 raise CandidateError(f"signals() missing {key!r}")
@@ -149,8 +161,8 @@ def mtm_curve(trades, close_1h, start_ms, end_ms, equity0):
     return H, eq
 
 
-def simulate(cand, p, gates, r, start_ms, end_ms, exposure_cap=4.0, equity0=10_000.0):
-    fee = TRANSACTION_FEE_PERCENT  # 呼叫時才讀，測試可 monkeypatch
+def simulate(cand, p, gates, r, start_ms, end_ms, *, fee, exposure_cap=4.0, equity0=10_000.0):
+    """fee：單邊手續費率，由評分端在 import candidate 前讀好傳入。"""
     tf = p.tf_ms
     bars = {}
     for s, b in p.bars.items():

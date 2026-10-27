@@ -27,7 +27,7 @@ def cand():
 
 def _score(cand, mp, sel, w, cut):
     mp.setattr(cand, "SELECTION", sel)
-    return cand.select_score(w, cut)
+    return cand.select_score(w, cut, w)  # baseline 不看 btc_w
 
 
 def test_selection_scores_match_live_functions(cand, monkeypatch):
@@ -66,7 +66,7 @@ def test_select_score_none_when_stale_or_short(cand, monkeypatch):
 
 def test_signals_entry_matches_entry_signal(cand):
     c = _walk(1500, 3, drift=0.001)
-    sig = cand.signals(_bars(c, HOUR_MS, 1_700_000_000_000))
+    sig = cand.signals(_bars(c, HOUR_MS, 1_700_000_000_000), {})  # baseline 不看 aux
     ind = V.indicators(c)
     ref = [V.entry_signal(c[i], *(x[i] for x in ind)) for i in range(len(c))]
     assert sig["entry"].tolist() == ref and any(ref)

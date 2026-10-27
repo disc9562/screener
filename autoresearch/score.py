@@ -12,9 +12,13 @@ from typing import Callable
 
 import numpy as np
 
-from autoresearch import data
+import config
+from autoresearch import data, engine
 from autoresearch.bars import DAY_MS, MIN_MS, Bars, resample
 from autoresearch.engine import SimResult, Trade, build_daily_gates, prepare, simulate
+from autoresearch.guard import check_candidate_source
+
+CAND_PATH = "strategy/candidate.py"  # 相對 cwd（loop 在 repo 根目錄跑評分）
 
 BAND = (0.24, 0.26)
 R0 = 0.04
@@ -116,16 +120,16 @@ def _signals_prefix_ok(p_cut, p_full) -> bool:
     return True
 
 
-def prefix_ok(cand, base5m, gates, r, start_ms, end_ms, full: SimResult, cuts: list[int],
-              full_prep=None) -> bool:
+def prefix_ok(cand, base5m, gates, r, start_ms, end_ms, full: SimResult, cuts: list[int], *,
+              fee: float, btc5m: Bars, full_prep=None) -> bool:
     for cut in cuts:
         trunc = {s: b.window(0, int(np.searchsorted(b.t + 5 * MIN_MS, cut, "right")))
                  for s, b in base5m.items()}
         g = {d: v for d, v in gates.items() if d < cut}
-        p_cut = prepare(cand, trunc, cut)
+        p_cut = prepare(cand, trunc, cut, btc5m)  # prepare 也把 aux 的 base5m／btc5m 截在 cut
         if full_prep is not None and not _signals_prefix_ok(p_cut, full_prep):
             return False
-        res = simulate(cand, p_cut, g, r, start_ms, cut)
+        res = simulate(cand, p_cut, g, r, start_ms, cut, fee=fee)
         a, b = _view(full.trades, cut), _view(res.trades, cut)
         if len(a) != len(b):
             return False
@@ -163,8 +167,8 @@ def coin_profit_share(trades, k: int = 3) -> list[tuple[str, float]]:
     return [(s, v / tot) for s, v in sorted(pos.items(), key=lambda kv: -kv[1])[:k]]
 
 
-def evaluate(cand, base5m: dict[str, Bars], universe: list[str], *, baseline: bool, seed: int) -> dict:
-    start_ms, end_ms = data.START_MS, data.END_MS  # 呼叫時才讀，測試可 monkeypatch
+def evaluate(cand, base5m: dict[str, Bars], universe: list[str], *, baseline: bool, seed: int,
+             fee: float, start_ms: int, end_ms: int) -> dict:
     secs = {"gates": 0.0, "prepare": 0.0, "calibrate": 0.0, "prefix": 0.0}
     out = {"status": "fail", "reason": "", "description": getattr(cand, "DESCRIPTION", ""),
            "entry_tf": getattr(cand, "ENTRY_TF", None), "select_window": getattr(cand, "SELECT_WINDOW_4H", None),
@@ -173,17 +177,17 @@ def evaluate(cand, base5m: dict[str, Bars], universe: list[str], *, baseline: bo
            "yearly": [], "top_coins": [], "seconds": secs}
     try:
         t0 = time.time()
+        btc5m = base5m[data.BTC]
         bars_4h = {s: resample(base5m[s], 240) for s in universe}
-        btc_1d = resample(base5m[data.BTC], 1440)
-        gates = build_daily_gates(cand, bars_4h, btc_1d, start_ms, end_ms)
+        gates = build_daily_gates(cand, bars_4h, resample(btc5m, 240), resample(btc5m, 1440), start_ms, end_ms)
         secs["gates"] = time.time() - t0
         t0 = time.time()
         uni5m = {s: base5m[s] for s in universe}
-        p = prepare(cand, uni5m, end_ms)
+        p = prepare(cand, uni5m, end_ms, btc5m)
         secs["prepare"] = time.time() - t0
 
         t0 = time.time()
-        cal = calibrate(lambda r: simulate(cand, p, gates, r, start_ms, end_ms, equity0=EQUITY0))
+        cal = calibrate(lambda r: simulate(cand, p, gates, r, start_ms, end_ms, fee=fee, equity0=EQUITY0))
         secs["calibrate"] = time.time() - t0
         res, tr = cal.result, cal.result.trades
         wins = sum(t.pnl for t in tr if t.pnl > 0)
@@ -212,7 +216,8 @@ def evaluate(cand, base5m: dict[str, Bars], universe: list[str], *, baseline: bo
             span = end_ms - start_ms
             cuts = [int(rng.uniform(start_ms + 0.2 * span, end_ms - 0.05 * span)) // DAY_MS * DAY_MS
                     for _ in range(2)]
-            ok = prefix_ok(cand, uni5m, gates, cal.r, start_ms, end_ms, res, cuts, full_prep=p)
+            ok = prefix_ok(cand, uni5m, gates, cal.r, start_ms, end_ms, res, cuts, fee=fee, btc5m=btc5m,
+                           full_prep=p)
             secs["prefix"] = time.time() - t0
             if ok:
                 out.update(status="pass", reason=cal.status)
@@ -229,19 +234,35 @@ def _jsonable(o):
     return str(o)
 
 
+def _harness() -> tuple:
+    return engine.simulate, engine.prepare, engine.mtm_curve, engine.build_daily_gates
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--baseline", action="store_true")
     a = ap.parse_args(argv)
+    # 這些都在 import candidate 之前讀好，之後 candidate 改什麼全域都影響不到這次評分
+    fee, stop_pct = config.TRANSACTION_FEE_PERCENT, config.DISASTER_STOP_PCT
+    start_ms, end_ms = data.START_MS, data.END_MS
+    harness = _harness()
     try:
-        sys.modules.pop("strategy.candidate", None)
-        cand = importlib.import_module("strategy.candidate")
-        universe, base5m = data.load_all()
-        out = evaluate(cand, base5m, universe, baseline=a.baseline, seed=a.seed)
+        reason = check_candidate_source(CAND_PATH)
+        if reason:
+            out = {"status": "fail", "reason": reason}
+        else:
+            universe, base5m = data.load_all()
+            sys.modules.pop("strategy.candidate", None)
+            cand = importlib.import_module("strategy.candidate")
+            out = evaluate(cand, base5m, universe, baseline=a.baseline, seed=a.seed,
+                           fee=fee, start_ms=start_ms, end_ms=end_ms)
+            if any(x is not y for x, y in zip(harness, _harness())):
+                out.update(status="fail", reason="forbidden: harness modified")
     except Exception as e:
         out = {"status": "fail", "reason": f"error: {type(e).__name__}: {str(e)[:200]}"}
+    out.update(fee=fee, stop_pct=stop_pct, seed=a.seed)
     try:
         text = json.dumps(out, default=_jsonable)
     except Exception as e:

@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from autoresearch import data, score
+import config
+from autoresearch import data, engine, score
 from autoresearch.bars import DAY_MS, MIN_MS, Bars
 from autoresearch.engine import SimResult, Trade, prepare, simulate
 
@@ -64,7 +65,7 @@ def _walk(seed, n):
 
 
 def _cand(peek):
-    def signals(b):
+    def signals(b, aux):
         c = b.c
         entry = np.zeros(len(c), bool)
         if peek:
@@ -75,7 +76,7 @@ def _cand(peek):
 
     return SimpleNamespace(DESCRIPTION="t", ENTRY_TF="1h", SELECT_WINDOW_4H=10, TOP_N=2, signals=signals,
                            update_stop=lambda sig, i, pos: pos.stop, btc_gate=lambda c: True,
-                           select_score=lambda w, cut: 1.0)
+                           select_score=lambda w, cut, btc_w: 1.0)
 
 
 def test_prefix_check_catches_lookahead():
@@ -85,11 +86,12 @@ def test_prefix_check_catches_lookahead():
     gates = {d * DAY_MS: frozenset("AB") for d in range(days)}
     for peek, expect in ((False, True), (True, False)):
         cand = _cand(peek)
-        prep = prepare(cand, base, end)
-        full = simulate(cand, prep, gates, 0.02, 0, end)
+        prep = prepare(cand, base, end, base["A"])
+        full = simulate(cand, prep, gates, 0.02, 0, end, fee=0.0006)
         assert len(full.trades) > 20
         for d in range(6, 19, 2):
-            got = score.prefix_ok(cand, base, gates, 0.02, 0, end, full, [d * DAY_MS], full_prep=prep)
+            got = score.prefix_ok(cand, base, gates, 0.02, 0, end, full, [d * DAY_MS], fee=0.0006,
+                                  btc5m=base["A"], full_prep=prep)
             assert got is expect, (peek, d)
 
 
@@ -116,6 +118,29 @@ def test_cli_always_writes_json(monkeypatch, tmp_path):
     assert not (tmp_path / "o3.json.tmp").exists()
 
 
+def test_cli_guard_and_harness_check(monkeypatch, tmp_path):
+    bad = tmp_path / "candidate.py"
+    bad.write_text("import autoresearch.engine as E\nE.TRANSACTION_FEE_PERCENT = 0\n")
+    monkeypatch.setattr(score, "CAND_PATH", str(bad))
+    monkeypatch.setattr(data, "load_all", lambda: pytest.fail("guard must stop before loading data"))
+    out = tmp_path / "o.json"
+    assert score.main(["--out", str(out), "--seed", "7"]) == 0
+    js = json.loads(out.read_text())
+    assert (js["status"], js["reason"]) == ("fail", "forbidden: import autoresearch.engine at line 1")
+    assert (js["fee"], js["stop_pct"], js["seed"]) == (config.TRANSACTION_FEE_PERCENT, config.DISASTER_STOP_PCT, 7)
+
+    monkeypatch.undo()
+    monkeypatch.setattr(data, "load_all", lambda: ([], {}))
+
+    def swaps_engine(*a, **k):
+        monkeypatch.setattr(engine, "simulate", lambda *a, **k: None)
+        return {"status": "pass"}
+
+    monkeypatch.setattr(score, "evaluate", swaps_engine)
+    assert score.main(["--out", str(out), "--seed", "1"]) == 0
+    assert json.loads(out.read_text())["reason"] == "forbidden: harness modified"
+
+
 def test_yearly_and_coin_share():
     # 2021: 10000 -> 12000 -> 9000 -> 12000；2022: 12000 -> 10800
     t = np.array([1_620_000_000_000, 1_625_000_000_000, 1_630_000_000_000, 1_650_000_000_000], dtype=np.int64)
@@ -130,20 +155,19 @@ def test_yearly_and_coin_share():
 
 def test_evaluate_reports_error_and_few_trades(monkeypatch):
     days = 12
-    monkeypatch.setattr(data, "START_MS", 0)
-    monkeypatch.setattr(data, "END_MS", days * DAY_MS)
+    span = dict(fee=0.0006, start_ms=0, end_ms=days * DAY_MS)
     base = {"AAA": _walk(3, days * 288), data.BTC: _walk(4, days * 288)}
 
-    def boom(b):
+    def boom(b, aux):
         raise ValueError("bad")
 
     bad = _cand(False)
     bad.signals = boom
-    out = score.evaluate(bad, base, ["AAA"], baseline=False, seed=1)
+    out = score.evaluate(bad, base, ["AAA"], baseline=False, seed=1, **span)
     assert out["status"] == "fail" and out["reason"].startswith("error: ValueError")
 
     few = _cand(False)
-    few.signals = lambda b: {"entry": np.isin(np.arange(len(b)), [50, 100, 150, 200, 250]),
-                             "stop": b.c * 0.9}
-    out = score.evaluate(few, base, ["AAA"], baseline=True, seed=1)
+    few.signals = lambda b, aux: {"entry": np.isin(np.arange(len(b)), [50, 100, 150, 200, 250]),
+                                  "stop": b.c * 0.9}
+    out = score.evaluate(few, base, ["AAA"], baseline=True, seed=1, **span)
     assert out["status"] == "fail" and out["reason"] == "trades<=100" and out["trades"] <= 5

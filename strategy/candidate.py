@@ -2,7 +2,8 @@
 """autoresearch 的 candidate 策略檔（agent 唯一會改的檔，引擎只依賴下面的介面）。
 
 介面：DESCRIPTION、SELECTION、ENTRY_TF、SELECT_WINDOW_4H、TOP_N、
-select_score()、btc_gate()、signals()、update_stop()。
+select_score(w, cut_ms, btc_w)、btc_gate(btc_close)、signals(b, aux)、update_stop(sig, i, pos)。
+只能用傳進來的資料（全部唯讀）；可以 import 的模組與禁用寫法見 autoresearch/program.md。
 鎖死不能改的：出場（開單時框 rma(c,10) < rma(c,20) 以收盤出場）、止損只升不降、手續費。
 """
 import numpy as np
@@ -36,10 +37,11 @@ def _alligator(c: np.ndarray, require_233: bool) -> float | None:
     return float(score) if np.isfinite(score) and score > 0 else None
 
 
-def select_score(w: Bars, cut_ms: int) -> float | None:
+def select_score(w: Bars, cut_ms: int, btc_w: Bars) -> float | None:
     """每天 cutoff 的選標的分數。
 
     w：cutoff 前已收完的最近 SELECT_WINDOW_4H 根 4h（Bars）。
+    btc_w：BTCUSDT 用同一規則切出的 4h（Bars）。
     回傳分數（越大越優先，取前 TOP_N 檔），None = 不入選。
     """
     if len(w) < V.RS_BARS + 60 + V.RS_BARS_PER_DAY:
@@ -64,11 +66,13 @@ def btc_gate(btc_close: np.ndarray) -> bool:
     return len(btc_close) >= 250 and V.btc_bull(btc_close)
 
 
-def signals(b: Bars) -> dict[str, np.ndarray]:
+def signals(b: Bars, aux) -> dict[str, np.ndarray]:
     """進場訊號（向量化）。b：該幣在 ENTRY_TF 的完整歷史。
 
+    aux：唯讀 mapping，"base5m" = 該幣 5m、"btc5m" = BTCUSDT 5m（Bars），和 b 截在同一個結束時間；
+    可用 autoresearch.bars.resample 轉時框。對齊自己處理：第 i 根只能用收盤時間 <= b.t[i] + ENTRY_TF 的 5m。
     必須回傳 "entry"（bool，長度 n）與 "stop"（float，長度 n，第 i 根收盤開倉時的初始止損價）；
-    可再加其他陣列給 update_stop 用。
+    可再加其他陣列給 update_stop 用；每個值都必須是長度 n 的 numpy 陣列。
     鐵則：第 i 個元素只能用 b 的 0..i 的資料，不能偷看未來（引擎會做前綴檢查，違反即淘汰）。
     """
     c = b.c
