@@ -67,3 +67,12 @@ def test_freeze_universe_writes_once(monkeypatch, tmp_path):
                         lambda top_n, refresh: n.append(1) or ["A", "B"])
     assert data.freeze_universe() == data.freeze_universe() == ["A", "B"]
     assert len(n) == 1
+
+
+def test_load_all_is_cache_only(monkeypatch, tmp_path):
+    import pytest
+    monkeypatch.setattr(data, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data.B, "get_liquid_universe",
+                        lambda **k: pytest.fail("must not touch network"))
+    with pytest.raises(FileNotFoundError):
+        data.load_all()

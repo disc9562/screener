@@ -180,7 +180,11 @@ def ensure_data() -> list[str]:
 
 
 def load_all() -> tuple[list[str], dict[str, Bars]]:
-    syms = freeze_universe()
+    """只讀快取，不連網、不凍結選股池；缺東西就 FileNotFoundError。"""
+    up = CACHE_DIR / "universe.json"
+    if not up.exists():
+        raise FileNotFoundError(f"missing {up}")
+    syms = json.loads(up.read_text(encoding="utf-8"))["symbols"]
     data, missing = {}, []
     for s in dict.fromkeys(syms + [BTC]):
         b = load_5m(s)

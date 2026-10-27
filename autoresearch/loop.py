@@ -78,18 +78,21 @@ def build_prompt(program: str, rows: list[dict], ctx: Ctx) -> str:
     return f"{program}\n\n{head}\n\n## 最近 15 列（round / status / reason / total_return / description）\n{hist}\n"
 
 
-def run_agent(cmd: list[str], cwd: Path, log_path: Path, timeout: int = 900) -> None:
-    """輸出只寫 log 不解析；逾時就殺掉，當作沒改。"""
+def run_agent(cmd: list[str], cwd: Path, log_path: Path, timeout: int = 900) -> bool:
+    """輸出只寫 log 不解析。回傳 True = 正常結束，False = 逾時（process 已殺掉，呼叫端要丟棄這輪）。"""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "wb") as f:
         try:
             subprocess.run(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, timeout=timeout)
         except subprocess.TimeoutExpired:
             f.write(b"\n[autoresearch] agent timeout\n")
+            return False
+    return True
 
 
 def run_eval(cwd: Path, out: Path, *, baseline: bool, seed: int, timeout: int = 3600) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
+    out.unlink(missing_ok=True)  # 舊檔不能被誤當成這輪結果
     cmd = [sys.executable, "-m", "autoresearch.score", "--out", str(out), "--seed", str(seed)]
     if baseline:
         cmd.append("--baseline")
@@ -167,6 +170,8 @@ def tag_name(ctx: Ctx, suffix: str) -> str:
 def round0(ctx: Ctx, evaluator=None) -> list[dict]:
     evaluator = evaluator or run_eval
     rows = []
+    for old in git(ctx.cwd, "tag", "-l", tag_name(ctx, "r000-*")).splitlines():
+        git(ctx.cwd, "tag", "-d", old)  # round 0 只在沒有 tsv 時跑，殘留的 tag 是上次被中斷的
     for sel in BASELINES:
         t0 = time.monotonic()
         (ctx.cwd / CAND).write_text(variant_source(sel))
@@ -180,7 +185,7 @@ def round0(ctx: Ctx, evaluator=None) -> list[dict]:
                              time.monotonic() - t0))
     passed = [r for r in rows if r["status"] == "pass"]
     best = max(passed or rows, key=lambda r: num(r["total_return"]))
-    best["status"] = "keep"
+    best["status"] = "keep" if passed else "start"  # 全 fail 時只是起點，不是通過的版本
     ctx.best_tag = ctx.baseline_tag = best["version"]
     ctx.best_score = num(best["total_return"]) if passed else -math.inf
     git(ctx.cwd, "reset", "--hard", ctx.best_tag)
@@ -195,10 +200,12 @@ def research_round(ctx: Ctx, n: int, agent=None, evaluator=None) -> dict:
     tsv = ctx.run_dir / "results.tsv"
     t0 = time.monotonic()
     prompt = build_prompt(PROGRAM.read_text(), read_rows(tsv), ctx)
-    agent(build_claude_cmd(prompt, ctx.model), ctx.cwd, ctx.run_dir / f"agent_r{n:03d}.log")
+    finished = agent(build_claude_cmd(prompt, ctx.model), ctx.cwd, ctx.run_dir / f"agent_r{n:03d}.log")
     files = changed_files(ctx.cwd)
     res, version = {}, ""
-    if files != {CAND}:
+    if finished is False:
+        status, reason = "discard", "agent timeout"
+    elif files != {CAND}:
         others = sorted(files - {CAND})
         status, reason = "discard", f"touched: {', '.join(others)}" if others else "no change"
     elif not (ctx.cwd / CAND).exists():
@@ -209,7 +216,7 @@ def research_round(ctx: Ctx, n: int, agent=None, evaluator=None) -> dict:
             git(ctx.cwd, "add", CAND)
             git(ctx.cwd, "commit", "-m", f"ar r{n:03d}: {res.get('description') or ''}")
             version = tag_name(ctx, f"r{n:03d}")
-            git(ctx.cwd, "tag", version)
+            git(ctx.cwd, "tag", "-f", version)
             status, reason = "pass", ""
             if res["total_return"] > ctx.best_score:
                 status = "keep"
@@ -218,7 +225,7 @@ def research_round(ctx: Ctx, n: int, agent=None, evaluator=None) -> dict:
             status, reason = "discard", res.get("reason") or "fail"
     if status == "discard":
         git(ctx.cwd, "checkout", "--", ".")
-        git(ctx.cwd, "clean", "-fd")  # 絕不加 -x：runs/ 與 .superpowers/ 是被 ignore 的
+        git(ctx.cwd, "clean", "-fd")  # 絕不加 -x：被 .gitignore 的 autoresearch/runs/ 要留著；其他未追蹤檔 main 啟動時已擋掉
     if status != "keep":
         git(ctx.cwd, "reset", "--hard", ctx.best_tag)
     row = make_row(n, res, status, reason, version, time.monotonic() - t0)
@@ -229,11 +236,21 @@ def research_round(ctx: Ctx, n: int, agent=None, evaluator=None) -> dict:
 
 def resume(ctx: Ctx, rows: list[dict]) -> int:
     """從 results.tsv 還原狀態，回傳下一輪編號。"""
-    best = max((r for r in rows if r["status"] == "keep"), key=lambda r: num(r["total_return"]))
+    keeps = [r for r in rows if r["status"] == "keep"]
+    if keeps:
+        best = max(keeps, key=lambda r: num(r["total_return"]))
+        ctx.best_score = num(best["total_return"])
+    else:  # round 0 全 fail：起點是 "start" 列，沒有分數
+        best = next(r for r in rows if r["status"] == "start")
+        ctx.best_score = -math.inf
     ctx.best_tag = best["version"]
-    ctx.best_score = num(best["total_return"]) if not best["reason"] else -math.inf  # 全 fail 起點沒有分數
-    ctx.baseline_tag = next(r["version"] for r in rows if r["round"] == "0" and r["status"] == "keep")
+    ctx.baseline_tag = next(r["version"] for r in rows if r["round"] == "0" and r["status"] in ("keep", "start"))
     return int(rows[-1]["round"]) + 1
+
+
+def restore(ctx: Ctx) -> None:
+    git(ctx.cwd, "checkout", "--", ".")
+    git(ctx.cwd, "reset", "--hard", ctx.best_tag)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -244,10 +261,14 @@ def main(argv: list[str] | None = None) -> int:
     cwd = Path.cwd()
     branch = require_branch(cwd)
     run_id = branch.removeprefix("autoresearch/")
+    stray = changed_files(cwd) - {CAND}
+    if stray:
+        print("工作目錄有其他未提交的檔案，請先 commit 或移除（迴圈不會動它們）：\n  " + "\n  ".join(sorted(stray)))
+        return 1
     ctx = Ctx(cwd=cwd, run_dir=cwd / "autoresearch" / "runs" / run_id, run_id=run_id, model=args.model)
     try:
         data.load_all()
-    except FileNotFoundError:
+    except Exception:
         print("缺資料，先執行 `python -m autoresearch.data`")
         return 1
     tsv = ctx.run_dir / "results.tsv"
@@ -255,11 +276,16 @@ def main(argv: list[str] | None = None) -> int:
         rows = read_rows(tsv)
         if rows:
             start = resume(ctx, rows)
+            restore(ctx)  # 上次中斷可能留下髒的 candidate 或偏離 best 的 HEAD
         else:
             round0(ctx)
             start = 1
         for n in range(start, start + args.rounds):
-            research_round(ctx, n)
+            try:
+                research_round(ctx, n)
+            except Exception as e:  # 單輪出錯不擋整個迴圈；KeyboardInterrupt 不在此列
+                restore(ctx)
+                append_row(tsv, make_row(n, {}, "discard", f"error: {type(e).__name__}: {e}"[:200], "", 0.0))
     except KeyboardInterrupt:
         if ctx.best_tag:
             git(cwd, "checkout", "--", ".")
