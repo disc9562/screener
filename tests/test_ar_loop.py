@@ -1,12 +1,13 @@
 import math
 import subprocess
+import sys
 
 import pytest
 
 from autoresearch import loop
 from autoresearch.baselines import variant_source
-from autoresearch.loop import (CAND, Ctx, changed_files, append_row, build_claude_cmd, git, read_rows, require_branch, research_round,
-                               round0, top3, write_report)
+from autoresearch.loop import (CAND, Ctx, build_claude_cmd, changed_files, git, read_rows, require_branch, research_round,
+                               round0, run_agent, top3, write_report, write_rows)
 
 
 @pytest.fixture
@@ -30,9 +31,18 @@ def make_ctx(repo):
 
 
 def test_build_claude_cmd():
-    assert build_claude_cmd("x", None)[:3] == ["claude", "-p", "x"]
-    assert "--model" not in build_claude_cmd("x", None)
+    assert build_claude_cmd("x", None) == [
+        "claude", "-p", "x", "--safe-mode", "--permission-mode", "acceptEdits", "--tools", "Read,Edit,Glob,Grep",
+        "--disallowedTools", "Bash,Write,WebFetch,WebSearch,Task"]
     assert build_claude_cmd("x", "sonnet")[-2:] == ["--model", "sonnet"]
+
+
+def test_run_agent_reports_exit_code_and_closes_stdin(tmp_path):
+    log = tmp_path / "a.log"
+    code = "import sys; print(repr(sys.stdin.read())); sys.exit(3)"
+    assert run_agent([sys.executable, "-c", code], tmp_path, log) == "agent exit 3"
+    assert log.read_text().strip() == "''"
+    assert run_agent([sys.executable, "-c", "pass"], tmp_path, log) is None
 
 
 def test_require_branch_rejects_main(git_repo):
@@ -95,7 +105,7 @@ def test_round0_starts_even_if_all_baselines_fail(git_repo):
 
 def test_keyboard_interrupt_resets_and_reports(git_repo, monkeypatch):
     monkeypatch.chdir(git_repo)
-    monkeypatch.setattr(loop.data, "load_all", lambda: None)
+    monkeypatch.setattr(loop.data, "cache_ready", lambda: True)
     git(git_repo, "tag", "ar/test/base")
 
     def fake_round0(ctx, evaluator=None):
@@ -157,7 +167,7 @@ def test_agent_timeout_discards_without_eval(git_repo):
 
     def agent(cmd, cwd, log):
         (git_repo / CAND).write_text("half\n")
-        return False
+        return "agent timeout"
 
     def ev(*a, **k):
         raise AssertionError("evaluator must not run")
@@ -177,20 +187,18 @@ def test_main_refuses_stray_files(git_repo, monkeypatch):
 def test_main_missing_data_returns_1(git_repo, monkeypatch, capsys):
     monkeypatch.chdir(git_repo)
 
-    def boom():
-        raise FileNotFoundError("x")
-    monkeypatch.setattr(loop.data, "load_all", boom)
+    monkeypatch.setattr(loop.data, "cache_ready", lambda: False)
     assert loop.main([]) == 1
     assert "python -m autoresearch.data" in capsys.readouterr().out
 
 
 def test_round_error_becomes_discard_and_restores(git_repo, monkeypatch):
     monkeypatch.chdir(git_repo)
-    monkeypatch.setattr(loop.data, "load_all", lambda: None)
+    monkeypatch.setattr(loop.data, "cache_ready", lambda: True)
     git(git_repo, "tag", "ar/test/base")
     tsv = git_repo / "autoresearch/runs/test/results.tsv"
-    append_row(tsv, {**_row("0", "keep", "", "1.0", "ar/test/base"), "seconds": "0.0"})
-    monkeypatch.setattr(loop, "run_agent", lambda cmd, cwd, log: (git_repo / CAND).write_text("dirty\n"))
+    write_rows(tsv, [{**_row("0", "keep", "", "1.0", "ar/test/base"), "seconds": "0.0"}])
+    monkeypatch.setattr(loop, "run_agent", lambda cmd, cwd, log: (git_repo / CAND).write_text("dirty\n") and None)
 
     def bad_eval(*a, **k):
         raise RuntimeError("boom")
@@ -199,3 +207,62 @@ def test_round_error_becomes_discard_and_restores(git_repo, monkeypatch):
     last = read_rows(tsv)[-1]
     assert last["status"] == "discard" and last["reason"].startswith("error: RuntimeError")
     assert (git_repo / CAND).read_text() == "v0\n" and not changed_files(git_repo)
+
+
+def test_ignored_files_run_files_and_scoring_writes_are_discarded(git_repo):
+    ctx = make_ctx(git_repo)
+    ctx.best_tag = "ar/test/base"
+    git(git_repo, "tag", ctx.best_tag)
+    ctx.run_dir.mkdir(parents=True)
+    old = ctx.run_dir / "r000-x.json"
+    old.write_text("{}")
+
+    def no_eval(*a, **k):
+        raise AssertionError("evaluator must not run")
+
+    def hides_helper(cmd, cwd, log):  # 審查重現：巢狀 .gitignore 藏住 helper
+        (git_repo / CAND).write_text("from strategy import helper\n")
+        (git_repo / "strategy/.gitignore").write_text("*\n!candidate.py\n")
+        (git_repo / "strategy/helper.py").write_text("x = 1\n")
+
+    row = research_round(ctx, 1, hides_helper, no_eval)
+    assert (row["status"], row["reason"]) == ("discard", "touched: strategy/.gitignore, strategy/helper.py")
+    assert not (git_repo / "strategy/helper.py").exists() and not (git_repo / "strategy/.gitignore").exists()
+
+    def edits_run_files(cmd, cwd, log):
+        (git_repo / CAND).write_text("v1\n")
+        old.write_text('{"status": "pass"}')
+        (ctx.run_dir / "r002.json").write_text('{"status": "pass"}')
+
+    row = research_round(ctx, 2, edits_run_files, no_eval)
+    assert row["reason"] == "touched run files"
+    assert old.read_text() == "{}" and not (ctx.run_dir / "r002.json").exists()
+
+    def writes_while_scoring(cwd, out, *, baseline, seed):
+        (git_repo / "stray.txt").write_text("x")
+        out.write_text("{}")
+        return {"status": "pass", "total_return": 99}
+
+    row = research_round(ctx, 3, lambda cmd, cwd, log: (git_repo / CAND).write_text("v3\n") and None,
+                         writes_while_scoring)
+    assert (row["status"], row["reason"]) == ("discard", "touched: stray.txt")
+    assert not (git_repo / "stray.txt").exists() and (git_repo / CAND).read_text() == "v0\n"
+    assert [r["round"] for r in read_rows(ctx.run_dir / "results.tsv")] == ["1", "2", "3"]
+
+
+def test_main_stops_on_broken_round0_and_on_agent_failures(git_repo, monkeypatch):
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr(loop.data, "cache_ready", lambda: True)
+    tsv = git_repo / "autoresearch/runs/test/results.tsv"
+    monkeypatch.setattr(loop, "run_eval", lambda cwd, out, *, baseline, seed: {"status": "fail", "reason": "no output"})
+    monkeypatch.setattr(loop, "run_agent", lambda *a: pytest.fail("no agent round after a broken round 0"))
+    assert loop.main(["--rounds", "3"]) == 2
+    assert not tsv.exists() and (tsv.parent / "report.md").exists()
+
+    monkeypatch.setattr(loop, "run_eval",
+                        lambda cwd, out, *, baseline, seed: {"status": "pass", "reason": "in_band", "total_return": 1})
+    calls = []
+    monkeypatch.setattr(loop, "run_agent", lambda cmd, cwd, log: calls.append(1) or "agent exit 1")
+    assert loop.main(["--rounds", "10"]) == 2 and len(calls) == 3
+    rows = read_rows(tsv)
+    assert rows[0]["reason"] == "in_band" and [r["reason"] for r in rows[5:]] == ["agent exit 1"] * 3

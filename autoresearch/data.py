@@ -152,6 +152,9 @@ def freeze_universe(n: int = 60) -> list[str]:
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))["symbols"]
     syms = B.get_liquid_universe(top_n=n, refresh=False)
+    if len(syms) < n:
+        raise RuntimeError(f"get_liquid_universe 只回 {len(syms)} 檔（要 {n}），不寫 universe.json；"
+                           "檢查網路或 Binance API 後重跑")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"created": datetime.now(timezone.utc).isoformat(),
                              "symbols": syms}), encoding="utf-8")
@@ -176,7 +179,17 @@ def ensure_data() -> list[str]:
         start = BTC_FETCH_START_MS if s == BTC else FETCH_START_MS
         b = download_symbol(s, start, END_MS, onboard.get(s, 0))
         print(f"[{i}/{len(todo)}] {s}: {len(b)} bars")
+    print(f"{len(dict.fromkeys(syms + [BTC]))} symbols ready")
     return syms
+
+
+def cache_ready() -> bool:
+    """只看 universe.json 與每檔 npz 在不在，不載入。"""
+    up = CACHE_DIR / "universe.json"
+    if not up.exists():
+        return False
+    syms = json.loads(up.read_text(encoding="utf-8"))["symbols"]
+    return all(_path(s).exists() for s in dict.fromkeys(syms + [BTC]))
 
 
 def load_all() -> tuple[list[str], dict[str, Bars]]:

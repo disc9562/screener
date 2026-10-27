@@ -62,11 +62,15 @@ def test_download_symbol_skips_before_onboard_and_falls_back_on_404(monkeypatch,
 
 def test_freeze_universe_writes_once(monkeypatch, tmp_path):
     monkeypatch.setattr(data, "CACHE_DIR", tmp_path)
+    import pytest
     n = []
     monkeypatch.setattr(data.B, "get_liquid_universe",
                         lambda top_n, refresh: n.append(1) or ["A", "B"])
-    assert data.freeze_universe() == data.freeze_universe() == ["A", "B"]
-    assert len(n) == 1
+    with pytest.raises(RuntimeError):
+        data.freeze_universe()  # 要 60 檔只回 2 檔：不寫檔
+    assert not (tmp_path / "universe.json").exists()
+    assert data.freeze_universe(2) == data.freeze_universe(2) == ["A", "B"]
+    assert len(n) == 2
 
 
 def test_load_all_is_cache_only(monkeypatch, tmp_path):
@@ -76,3 +80,4 @@ def test_load_all_is_cache_only(monkeypatch, tmp_path):
                         lambda **k: pytest.fail("must not touch network"))
     with pytest.raises(FileNotFoundError):
         data.load_all()
+    assert data.cache_ready() is False
