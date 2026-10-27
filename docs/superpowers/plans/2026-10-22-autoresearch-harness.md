@@ -691,11 +691,14 @@ Expected: `git worktree list` 只剩原本的 worktree，`git tag -l "ar/smoke/*
 3. 抽查重新取樣和 Binance 原生日線一致：
    ```bash
    python - <<'EOF'
-   import json, numpy as np
+   import json, subprocess, numpy as np
    from pathlib import Path
    from autoresearch import data, bars
+   # worktree 裡沒有 data/；主 repo = git common dir 的上一層
+   main_repo = Path(subprocess.check_output(
+       ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True).strip()).parent
    d = bars.resample(data.load_5m("BTCUSDT"), 1440)
-   raw = json.loads(Path("data/backtest_cache/klines_BTCUSDT_1d_1000.json").read_text())
+   raw = json.loads((main_repo / "data/backtest_cache/klines_BTCUSDT_1d_1000.json").read_text())
    ref = {int(r[0]): [float(x) for x in r[1:6]] for r in raw}
    both = [i for i, t in enumerate(d.t) if int(t) in ref]
    bad = [int(d.t[i]) for i in both if not np.allclose([d.o[i], d.h[i], d.l[i], d.c[i], d.v[i]], ref[int(d.t[i])], rtol=1e-9)]
@@ -703,5 +706,7 @@ Expected: `git worktree list` 只剩原本的 worktree，`git tag -l "ar/smoke/*
    EOF
    ```
    沒有 `klines_BTCUSDT_1d_1000.json` 時，先在主 repo 跑一次 `python tools/backtest_compare.py`。預期 overlap > 500、`0 mismatch`。有 mismatch 就停。
-4. 跑第 0 輪：`python -m autoresearch.loop --rounds 0`。單一 baseline 超過 10 分鐘就先停，看 `seconds` 哪一段最慢。
-5. 確認第 0 輪合理後，開跑：`python -m autoresearch.loop --rounds 30`。結果在 `autoresearch/runs/<日期>/report.md`。
+4. 跑第 0 輪：`python -m autoresearch.loop --rounds 0`。看 `autoresearch/runs/<日期>/results.tsv`：5 列都在、`reason` 不是 `error:`／`timeout`／`no output`（全部是的話迴圈會回 2 並停下，看同目錄的 `r000-*.score.log`）、每列 `seconds` 合理。單一 baseline 超過 10 分鐘就先停，看 JSON 的 `seconds` 哪一段最慢。
+5. 只跑 1 輪：`python -m autoresearch.loop --rounds 1`。讀 `autoresearch/runs/<日期>/agent_r001.log`，確認 agent 有照 `program.md` 只改 `strategy/candidate.py`、沒有卡在提問或權限；`results.tsv` 第 1 輪的 `reason` 合理。
+6. 前兩步都正常才開跑：`python -m autoresearch.loop --rounds 30`（從第 2 輪接著跑）。結果在 `autoresearch/runs/<日期>/report.md`。
+   同一台主機還跑著 pm2 的 `crypto-screener` 時，用 `nice` 降低優先序，別搶實盤的 CPU：`nice -n 10 python -m autoresearch.loop --rounds 30`（第 4、5 步同樣加 `nice -n 10`）。
