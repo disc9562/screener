@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 MIN_UNIVERSE_COVERAGE = 0.9          # 4h 資料抓到的幣 ≥ 母體 90% 才算完整
 MIN_BTC_DAYS = 1000
 DEFAULT_FETCH_WORKERS = 4
+BREADTH_4H_LIMIT = 130               # 每 4 小時更新寬度基準：120 根均線＋去掉還沒收完的那根
+BREADTH_MAX_AGE_MS = 2 * V.HOUR_MS   # 寬度讀數超過 2 小時沒更新 → 視為未知：不進新倉，也不據此平倉
+PRICE_MAX_AGE_MS = 2 * V.HOUR_MS     # 全市場價格超過 2 小時沒更新 → 平倉的紙上價格改用最新的 1h 收盤
+BREADTH_BASE_MAX_AGE_MS = 12 * V.HOUR_MS
 
 
 class RebalanceIncomplete(Exception):
@@ -38,7 +42,8 @@ def _dedup_sorted_rows(rows, cut_ms):
 
 class ShotgunV3Live:
     def __init__(self, fetcher, exclude_symbols=(), exclude_bases=(), now_ms=None, shadow_fetcher=None,
-                 fetch_workers=DEFAULT_FETCH_WORKERS, rs_mode="alligator", min_daily_quote_vol=0.0):
+                 fetch_workers=DEFAULT_FETCH_WORKERS, rs_mode="alligator", min_daily_quote_vol=0.0,
+                 breadth_on=V.BREADTH_ON, breadth_min_daily_qv=V.BREADTH_MIN_DAILY_QV, entry_requires_gate_now=True):
         self.fetcher = fetcher
         self.shadow_fetcher = shadow_fetcher or fetcher   # 影子記錄在背景執行緒，用獨立 client（限速額度仍共用）
         self.exclude_symbols = set(exclude_symbols)
@@ -47,10 +52,21 @@ class ShotgunV3Live:
         self.fetch_workers = max(1, int(fetch_workers))
         self.rs_mode = rs_mode
         self.min_daily_quote_vol = float(min_daily_quote_vol)
+        self.breadth_on = float(breadth_on)
+        self.breadth_min_daily_qv = float(breadth_min_daily_qv)
+        # 進場時，處理當下的開關也不能是確定關掉（v3.1）。00:00 先依當天的 BTC 旗標全平，接著處理的 23:00 那根
+        # 依 v3 慣例用前一天的旗標；不擋的話會「全平後又開倉、01:00 再平」。False = 原版 v3 的慣例（重播的 v3 preset 用）
+        self.entry_requires_gate_now = bool(entry_requires_gate_now)
         self.days = {}                       # date -> (frozenset 名單, 是否多頭日)
         self.states = {}                     # symbol -> V.SymbolState
         self.rows_4h = {}                    # 最近一次換日抓到的 4h（影子記錄重用，不再多抓）
         self.universe = []                   # 最近一次換日的母體（含 4h 沒抓到的幣）
+        self.breadth_smas = {}               # symbol -> 20 日均線（只含可交易幣），每 4 小時更新
+        self.breadth_base_ms = None          # 上面這組均線是哪個 4h 收盤算的
+        self.breadth_value = None            # 最近一次寬度讀數
+        self.breadth_ms = None               # 讀數時間
+        self.last_prices = {}                # 最近一次全市場價格（平倉時當紙上價格用）
+        self.last_prices_ms = None           # 上面這組價格的抓取時間
 
     def _is_excluded(self, sym: str) -> bool:
         if sym in self.exclude_symbols:
@@ -65,11 +81,11 @@ class ShotgunV3Live:
     def _universe(self):
         return [s for s in self.fetcher.get_all_symbols() if not self._is_excluded(s)]
 
-    def _fetch_4h_map(self, universe):
+    def _fetch_4h_map(self, universe, limit=300):
         if self.fetch_workers <= 1 or len(universe) <= 1:
-            return {sym: self.fetcher.fetch_klines(sym, "4h", 300) for sym in universe}
+            return {sym: self.fetcher.fetch_klines(sym, "4h", limit) for sym in universe}
         with ThreadPoolExecutor(max_workers=self.fetch_workers) as pool:
-            futs = {sym: pool.submit(self.fetcher.fetch_klines, sym, "4h", 300) for sym in universe}
+            futs = {sym: pool.submit(self.fetcher.fetch_klines, sym, "4h", limit) for sym in universe}
             return {sym: futs[sym].result() for sym in universe}
 
     @staticmethod
@@ -122,8 +138,87 @@ class ShotgunV3Live:
         self.rows_4h, self.universe = rows_4h, list(universe)
         for d in sorted(self.days)[:-3]:
             del self.days[d]
-        logger.info(f"Rebalance {cutoff.date()} (mode={self.rs_mode}): bull={bull} list={top}")
+        self._set_breadth_base(rows_4h, cut_ms)
+        self._set_breadth({s: float(rows_4h[s][-1][4]) for s in self.breadth_smas}, cut_ms)   # 換日當下的讀數
+        logger.info(f"Rebalance {cutoff.date()} (mode={self.rs_mode}): bull={bull} breadth={self.breadth_value} list={top}")
         return top, bull
+
+    # ---------- 大盤寬度（docs/shotgun-v3.1-gate.md） ----------
+    def _set_breadth_base(self, rows_by_symbol, cut_ms):
+        self.breadth_smas = {s: m for s, rows in rows_by_symbol.items()
+                             if (m := V.breadth_sma(rows, cut_ms, min_daily_qv=self.breadth_min_daily_qv)) is not None}
+        self.breadth_base_ms = cut_ms
+
+    def _set_breadth(self, prices, at_ms):
+        value = V.breadth(prices, self.breadth_smas)
+        if value is None:
+            return None
+        self.breadth_value, self.breadth_ms = value, at_ms
+        return value
+
+    def refresh_breadth_base(self, cut_ms):
+        """每根 4h 收盤（cut_ms）重算每個幣的 20 日均線與流動性。抓不到母體 90% → 保留舊基準，回傳 False。"""
+        universe = self.universe or self._universe()
+        raw_map = self._fetch_4h_map(universe, limit=BREADTH_4H_LIMIT)
+        rows = {s: _dedup_sorted_rows(raw_map.get(s), cut_ms) for s in universe if raw_map.get(s)}
+        fresh = sum(1 for r in rows.values() if self._is_fresh_4h(r, cut_ms))
+        if not universe or len(rows) < MIN_UNIVERSE_COVERAGE * len(universe) or fresh < 0.5 * len(rows):
+            logger.warning(f"Breadth base at {pd.Timestamp(cut_ms, unit='ms')}: 4h for {len(rows)}/{len(universe)} symbols "
+                           f"({fresh} fresh), keep old")
+            return False
+        self._set_breadth_base(rows, cut_ms)
+        return True
+
+    def refresh_breadth(self, now_ms):
+        """每小時：全市場最新價格（一次請求）對照 20 日均線，更新寬度讀數。抓不到 → 保留舊讀數，回傳 None。"""
+        prices = self.fetcher.fetch_prices() or {}
+        if prices:
+            self.last_prices, self.last_prices_ms = prices, now_ms
+        return self._set_breadth(prices, now_ms) if prices else None
+
+    def breadth_now(self, now_ms):
+        """仍有效的寬度讀數（讀數 2 小時內、基準 12 小時內）；否則 None。"""
+        if self.breadth_ms is None or self.breadth_base_ms is None:
+            return None
+        if now_ms - self.breadth_ms > BREADTH_MAX_AGE_MS or now_ms - self.breadth_base_ms > BREADTH_BASE_MAX_AGE_MS:
+            return None
+        return self.breadth_value
+
+    def gate_state(self, now_ms):
+        """'on'（可開新倉）／'off'（確定關掉，要全平）／'unknown'（資料不足：不開新倉，也不平倉）。"""
+        info = self.days.get(pd.Timestamp(now_ms, unit="ms").date())
+        if info is not None and V.gate_on(info[1], self.breadth_now(now_ms), self.breadth_on):
+            return "on"
+        return "off" if self.gate_off_reason(now_ms) else "unknown"
+
+    def gate_off_reason(self, now_ms):
+        """開關「確定」關掉時回傳原因（btc / breadth），呼叫端據此全部平倉；資料缺漏或過期時回傳 None，不因此平倉。"""
+        info = self.days.get(pd.Timestamp(now_ms, unit="ms").date())
+        if info is not None and not info[1]:
+            return "btc"
+        b = self.breadth_now(now_ms)
+        if b is not None and b < self.breadth_on:
+            return "breadth"
+        return None
+
+    def price_for(self, symbol, now_ms=None):
+        """平倉用的紙上價格：2 小時內抓到的全市場價格；過期或沒有就用最後一根 1h 收盤；都沒有才用過期的全市場價格。"""
+        now_ms = self.now_ms() if now_ms is None else now_ms
+        fresh = self.last_prices_ms is not None and now_ms - self.last_prices_ms <= PRICE_MAX_AGE_MS
+        if fresh and symbol in self.last_prices:
+            return float(self.last_prices[symbol])
+        st = self.states.get(symbol)
+        if st is not None and len(st.closes):
+            return float(st.closes[-1])
+        return float(self.last_prices[symbol]) if symbol in self.last_prices else None
+
+    def last_closed_bar(self, symbol, now_ms):
+        """最近一根收完的 1h K 棒 (open_ms, high, low, close)，用 REST 抓；抓不到回 None。全平前的止損檢查用。"""
+        rows = _closed(self.fetcher.fetch_klines(symbol, "1h", 3) or [], now_ms)
+        if not rows:
+            return None
+        r = rows[-1]
+        return int(r[0]), float(r[2]), float(r[3]), float(r[4])
 
     def day_info(self, open_ms):
         return self.days.get(pd.Timestamp(open_ms, unit="ms").date(), (frozenset(), False))
@@ -165,7 +260,10 @@ class ShotgunV3Live:
         if has_position:
             return "SELL" if V.exit_signal(snap.s10, snap.s20) else None
         lst, bull = self.day_info(open_ms)
-        if symbol in lst and bull and V.entry_signal(snap.close, snap.s10, snap.s20, snap.s50, snap.s233, snap.er):
+        now_ms = self.now_ms()
+        if (symbol in lst and V.gate_on(bull, self.breadth_now(now_ms), self.breadth_on)
+                and not (self.entry_requires_gate_now and self.gate_off_reason(now_ms))
+                and V.entry_signal(snap.close, snap.s10, snap.s20, snap.s50, snap.s233, snap.er)):
             return "BUY"
         return None
 

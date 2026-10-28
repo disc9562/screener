@@ -160,15 +160,24 @@ def test_418_ban_pauses_for_ban_length(mock_binance_client, monkeypatch):
 
 
 def test_get_all_symbols_only_trading_usdt_perpetuals(mock_binance_client):
+    def item(symbol, quote="USDT", contract="PERPETUAL", status="TRADING", underlying="COIN"):
+        return {"symbol": symbol, "pair": symbol, "quoteAsset": quote, "contractType": contract, "status": status,
+                "underlyingType": underlying}
+
     mock_binance_client.futures_exchange_info.return_value = {"symbols": [
-        {"symbol": "BTCUSDT", "pair": "BTCUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "TRADING"},
-        {"symbol": "BTCUSDT_261225", "pair": "BTCUSDT", "quoteAsset": "USDT", "contractType": "CURRENT_QUARTER", "status": "TRADING"},
-        {"symbol": "FTTUSDT", "pair": "FTTUSDT", "quoteAsset": "USDT", "contractType": "PERPETUAL", "status": "SETTLING"},
-        {"symbol": "ETHUSDC", "pair": "ETHUSDC", "quoteAsset": "USDC", "contractType": "PERPETUAL", "status": "TRADING"},
+        item("BTCUSDT"),
+        item("CVXUSDT"),                                                   # Convex：和雪佛龍代號撞名，但它是幣
+        item("BTCUSDT_261225", contract="CURRENT_QUARTER"),
+        item("FTTUSDT", status="SETTLING"),
+        item("ETHUSDC", quote="USDC"),
+        item("BTCDOMUSDT", underlying="INDEX"),                            # 指數合約
+        item("ALLUSDT", underlying="INDEX"),
+        item("TSLAUSDT", contract="TRADIFI_PERPETUAL", underlying="EQUITY"),   # 代幣化股票
+        item("XAUUSDT", contract="TRADIFI_PERPETUAL", underlying="COMMODITY"),
     ]}
     fetcher = CryptoFetcher()
     fetcher.client = mock_binance_client
-    assert fetcher.get_all_symbols() == ["BTCUSDT"]
+    assert fetcher.get_all_symbols() == ["BTCUSDT", "CVXUSDT"]
 
 
 def test_network_errors_are_retried_then_return_none(mock_binance_client):
