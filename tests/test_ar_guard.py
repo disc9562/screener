@@ -93,7 +93,24 @@ FORBIDDEN = [
     "x = np.load('BTCUSDT.npz')",
     "x = pd.read_csv('x.csv')",
     "config.os.system('true')",
+    "config.CRYPTO_SMA_PERIODS.append(1)",
+    "from config import CRYPTO_SMA_PERIODS as P\nP.append(1)",
+    "from config import CRYPTO_SMA_PERIODS as P\nP += [1]",
+    "from autoresearch.bars import TF_MINUTES\nTF_MINUTES['3h'] = 180",
+    "np.typecodes['x'] = 'y'",
 ]
+
+# 改的都是 candidate 自己的物件，或呼叫模組函式（np.append 回傳新陣列）
+LOCAL_MUTATIONS = """
+x = np.append(np.zeros(2), 1)
+x.sort()
+n = len(config.CRYPTO_SMA_PERIODS)
+L = []
+L.append(n)
+d = {}
+d['k'] = 1
+d['k'] += 1
+"""
 
 
 def _check(tmp_path, src):
@@ -107,6 +124,7 @@ def test_baselines_and_atr_candidate_pass(tmp_path):
     for sel in BASELINES:
         assert _check(tmp_path, variant_source(sel)) is None
     assert _check(tmp_path, ATR_CANDIDATE) is None
+    assert _check(tmp_path, HEAD + LOCAL_MUTATIONS) is None
 
 
 @pytest.mark.parametrize("snippet", FORBIDDEN)

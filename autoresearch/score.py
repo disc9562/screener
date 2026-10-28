@@ -3,9 +3,11 @@ import argparse
 import importlib
 import json
 import os
+import pickle
 import random
 import sys
 import time
+import types
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
@@ -244,6 +246,24 @@ def _fresh_candidate():
     return importlib.import_module("strategy.candidate")
 
 
+# candidate 能 import、但不會跟著重新載入的專案模組（numpy／pandas 的內部狀態靠 guard 擋）
+WATCHED = ("config", "autoresearch.bars", "autoresearch.indicators", "strategy.shotgun_v3", "strategy.shadow_lists")
+
+
+def _module_state() -> dict:
+    """WATCHED 模組的模組層級資料。評分前後不一樣，就是 candidate 想把狀態帶過截斷點。"""
+    out = {}
+    for m in WATCHED:
+        for k, v in vars(importlib.import_module(m)).items():
+            if k.startswith("__") or callable(v) or isinstance(v, types.ModuleType):
+                continue
+            try:
+                out[m, k] = pickle.dumps(v)
+            except Exception:
+                out[m, k] = repr(v)
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -260,10 +280,11 @@ def main(argv=None) -> int:
             out = {"status": "fail", "reason": reason}
         else:
             universe, base5m = data.load_all()
+            state = _module_state()
             cand = _fresh_candidate()
             out = evaluate(cand, base5m, universe, baseline=a.baseline, seed=a.seed,
                            fee=fee, start_ms=start_ms, end_ms=end_ms, fresh=_fresh_candidate)
-            if any(x is not y for x, y in zip(harness, _harness())):
+            if any(x is not y for x, y in zip(harness, _harness())) or _module_state() != state:
                 out.update(status="fail", reason="forbidden: harness modified")
     except Exception as e:
         out = {"status": "fail", "reason": f"error: {type(e).__name__}: {str(e)[:200]}"}

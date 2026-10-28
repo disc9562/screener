@@ -137,6 +137,7 @@ def test_cli_passes_fresh_loader(monkeypatch, tmp_path):
     monkeypatch.setattr(score, "evaluate",
                         lambda cand, *a, fresh=None, **k: seen.update(cand=cand, fresh=fresh) or {"status": "pass"})
     assert score.main(["--out", str(tmp_path / "o.json"), "--seed", "1"]) == 0
+    assert json.loads((tmp_path / "o.json").read_text())["status"] == "pass"  # 模組快照沒誤判
     assert seen["fresh"] is score._fresh_candidate
     assert seen["fresh"]() is not seen["cand"]
 
@@ -183,6 +184,14 @@ def test_cli_guard_and_harness_check(monkeypatch, tmp_path):
         return {"status": "pass"}
 
     monkeypatch.setattr(score, "evaluate", swaps_engine)
+    assert score.main(["--out", str(out), "--seed", "1"]) == 0
+    assert json.loads(out.read_text())["reason"] == "forbidden: harness modified"
+
+    # 別名繞過 guard 時，評分後的模組快照比對仍會抓到
+    monkeypatch.undo()
+    monkeypatch.setattr(data, "load_all", lambda: ([], {}))
+    monkeypatch.setattr(config, "CRYPTO_SMA_PERIODS", list(config.CRYPTO_SMA_PERIODS))  # 改複本，測完還原
+    monkeypatch.setattr(score, "evaluate", lambda *a, **k: config.CRYPTO_SMA_PERIODS.append(1) or {"status": "pass"})
     assert score.main(["--out", str(out), "--seed", "1"]) == 0
     assert json.loads(out.read_text())["reason"] == "forbidden: harness modified"
 

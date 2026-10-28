@@ -16,6 +16,31 @@ FORBIDDEN_ATTRS = frozenset({"setflags", "flags", "base", "ctypes",
                              "f_back", "f_globals", "f_locals", "gi_frame", "cr_frame", "ag_frame", "tb_frame",
                              "npyio", "load", "loadtxt", "genfromtxt", "fromfile", "memmap", "open_memmap",
                              "DataSource"})
+# 就地修改內容的方法。對 import 進來的物件呼叫，等於把狀態存進不會隨 candidate 重新載入的模組
+MUTATING_METHODS = frozenset({"append", "extend", "insert", "remove", "pop", "popitem", "clear", "add", "discard",
+                              "update", "setdefault", "sort", "reverse", "fill", "put", "itemset", "resize",
+                              "partition"})
+
+
+def _imported(tree) -> dict[str, bool]:
+    """import 綁定的名字 -> 是不是整個模組。from-import 的名字可能就是容器，一律當物件。"""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out[a.asname or a.name.split(".")[0]] = True
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                out[a.asname or a.name] = False
+    return out
+
+
+def _reaches_imported(node, imported) -> bool:
+    """node 是不是 import 進來的模組裡的物件。只走屬性和下標，經過函式呼叫就是新物件。"""
+    steps = 0
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node, steps = node.value, steps + 1
+    return isinstance(node, ast.Name) and node.id in imported and (steps > 0 or not imported[node.id])
 
 
 def _import_problem(node) -> str | None:
@@ -56,6 +81,7 @@ def _idents(node):
 def check_candidate_source(path) -> str | None:
     """回傳最前面的違規 `forbidden: <what> at line N`；沒有就 None。語法錯誤直接丟 SyntaxError。"""
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    imported = _imported(tree)
     bad = []
     for node in ast.walk(tree):
         line = getattr(node, "lineno", 0)
@@ -64,6 +90,15 @@ def check_candidate_source(path) -> str | None:
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
             # 一律不准對屬性賦值／刪除：擋 E.X = 0，也擋 m = np; m.max = ... 這種別名繞法
             bad.append((line, f"attribute assignment {ast.unparse(node)}"))
+        # 改 import 進來的容器：config.L.append(1)、TF_MINUTES["3h"] = 180、L += [1]
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)) \
+                and _reaches_imported(node.value, imported):
+            bad.append((line, f"item assignment {ast.unparse(node)}"))
+        if isinstance(node, ast.AugAssign) and _reaches_imported(node.target, imported):
+            bad.append((line, f"augmented assignment {ast.unparse(node.target)}"))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in MUTATING_METHODS and _reaches_imported(node.func.value, imported):
+            bad.append((line, f"mutating call {ast.unparse(node.func)}"))
         for name, is_attr in _idents(node):
             if name in FORBIDDEN_NAMES or (name.startswith("__") and name.endswith("__")):
                 bad.append((line, f"name {name}"))
