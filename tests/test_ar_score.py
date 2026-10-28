@@ -7,7 +7,7 @@ import pytest
 
 import config
 from autoresearch import data, engine, score
-from autoresearch.bars import DAY_MS, MIN_MS, Bars
+from autoresearch.bars import DAY_MS, MIN_MS, Bars, resample
 from autoresearch.engine import SimResult, Trade, prepare, simulate
 
 
@@ -93,6 +93,52 @@ def test_prefix_check_catches_lookahead():
             got = score.prefix_ok(cand, base, gates, 0.02, 0, end, full, [d * DAY_MS], fee=0.0006,
                                   btc5m=base["A"], full_prep=prep)
             assert got is expect, (peek, d)
+
+
+def _cached_cand(peek):
+    cache = {}  # 模擬 candidate 的模組層級快取：BTC 1h 只算一次
+
+    def signals(b, aux):
+        if "btc" not in cache:
+            cache["btc"] = resample(aux["btc5m"], 60)
+        btc = cache["btc"]
+        k = np.clip(np.searchsorted(btc.t, b.t, "right") - (0 if peek else 1), 1, len(btc) - 1)
+        entry = np.zeros(len(b), bool)
+        entry[1:] = b.c[1:] > b.c[:-1]
+        return {"entry": entry & (btc.c[k] > btc.c[k - 1]), "stop": b.c * 0.995, "btc_ref": btc.c[k]}
+
+    return SimpleNamespace(DESCRIPTION="t", ENTRY_TF="1h", SELECT_WINDOW_4H=10, TOP_N=2, signals=signals,
+                           update_stop=lambda sig, i, pos: pos.stop, btc_gate=lambda c: True,
+                           select_score=lambda w, cut, btc_w: 1.0)
+
+
+def test_prefix_check_reloads_candidate_per_cut():
+    # covers: fresh@prefix_ok -> c -> prepare（peek 被訊號比對抓到）、c -> simulate（誠實版走到交易比對）
+    days = 20
+    base = {"A": _walk(1, days * 288), "B": _walk(2, days * 288)}
+    btc = _walk(3, days * 288)
+    end = days * DAY_MS
+    gates = {d * DAY_MS: frozenset("AB") for d in range(days)}
+    for peek, expect in ((False, True), (True, False)):
+        cand = _cached_cand(peek)
+        prep = prepare(cand, base, end, btc)  # 快取在這裡用完整的 BTC 填好
+        full = simulate(cand, prep, gates, 0.02, 0, end, fee=0.0006)
+        assert len(full.trades) > 10
+        for d in range(6, 19, 3):
+            got = score.prefix_ok(cand, base, gates, 0.02, 0, end, full, [d * DAY_MS], fee=0.0006,
+                                  btc5m=btc, full_prep=prep, fresh=lambda: _cached_cand(peek))
+            assert got is expect, (peek, d)
+
+
+def test_cli_passes_fresh_loader(monkeypatch, tmp_path):
+    # covers: _fresh_candidate@main -> evaluate(fresh=)，而且每次載入都是新的模組
+    seen = {}
+    monkeypatch.setattr(data, "load_all", lambda: ([], {}))
+    monkeypatch.setattr(score, "evaluate",
+                        lambda cand, *a, fresh=None, **k: seen.update(cand=cand, fresh=fresh) or {"status": "pass"})
+    assert score.main(["--out", str(tmp_path / "o.json"), "--seed", "1"]) == 0
+    assert seen["fresh"] is score._fresh_candidate
+    assert seen["fresh"]() is not seen["cand"]
 
 
 def test_cli_always_writes_json(monkeypatch, tmp_path):
