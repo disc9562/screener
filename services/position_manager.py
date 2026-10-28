@@ -21,6 +21,7 @@ class PositionManager:
         self.notification_service = notification_service
         self.strategy_config = strategy_config
         self.order_execution_service = order_execution_service
+        self._save_failing = False
         self.positions_df = self._load_positions()
 
     def _load_positions(self) -> pd.DataFrame:
@@ -47,8 +48,24 @@ class PositionManager:
         return df
 
     def _save_positions(self):
-        """Saves the current positions DataFrame to the CSV file."""
-        self.positions_df.to_csv(self.csv_path, index=False)
+        """Saves the current positions DataFrame to the CSV file.
+        寫不進去（例如 Windows 上檔案被 Excel 或防毒鎖住）只記錄、不往外丟：記憶體裡的持倉照常運作、交易所下單照常，
+        下一次存檔會整份重寫。連續失敗只在第一次發 Discord。"""
+        try:
+            self.positions_df.to_csv(self.csv_path, index=False)
+        except OSError as e:
+            logger.error(f"Could not save positions to {self.csv_path}: {e}")
+            if not self._save_failing:
+                self._save_failing = True
+                try:
+                    self.notification_service.send_heartbeat_notification(
+                        message=f"⚠️ 持倉檔寫不進去（{e}），記憶體中的持倉照常運作，下次存檔會再試")
+                except Exception:
+                    logger.exception("Heartbeat notification failed")
+            return
+        if self._save_failing:
+            self._save_failing = False
+            logger.info(f"Positions saved again to {self.csv_path}")
 
     def _opening_fee(self, entry_price: float, units: float) -> float:
         """Calculate the transaction fee for opening a position."""
@@ -302,20 +319,37 @@ class PositionManager:
         if self.order_execution_service and not orders:
             self.notification_service.send_heartbeat_notification(
                 message=f"⚠️ {symbol} 交易所平倉失敗（試 3 次），紙上已記為平倉，交易所多單與止損單仍在，請手動處理")
+        elif isinstance((orders or {}).get('close'), dict) and orders['close'].get('status') == 'ALREADY_CLOSED':
+            # -2022：交易所端的倉已經沒了，多半是災難止損先成交；紙上這筆的價格和交易所實際成交不同
+            logger.warning(f"{symbol} was already closed on the exchange; paper exit booked as {reason} at {price}")
+            self.notification_service.send_heartbeat_notification(
+                message=f"⚠️ {symbol} 交易所端已先平倉（多半是災難止損成交），紙上以 {price:.6g} 記為 {reason}，"
+                        f"請核對交易所成交價")
         self.notification_service.send_trade_notification(
             symbol=symbol, action="SELL", price=price, units=pos['units'], reason=reason, pnl=pnl,
             is_volume_on=False, testnet_orders=orders)
         return True
 
     def close_all(self, prices, timestamp, reason) -> list:
-        """全部持倉市價平倉（大盤開關關掉時）。prices：{symbol: 紙上平倉價}；缺價格的幣用進場價記帳並警示。"""
-        closed = []
+        """全部持倉市價平倉（大盤開關關掉時）。prices：{symbol: 紙上平倉價}；缺價格的幣用進場價記帳並警示。
+        一檔出錯不影響其他檔：記 log、發一則警示列出沒平掉的幣，下個整點開關仍關著時會再平一次。"""
+        closed, failed = [], []
         for symbol in self.get_open_positions_symbols():
-            price = prices.get(symbol)
-            if price is None:
-                row = self.positions_df[(self.positions_df['symbol'] == symbol) & (self.positions_df['status'] == 'OPEN')].iloc[0]
-                price = float(row['entry_price'])
-                logger.warning(f"No price for {symbol} at {reason}; paper exit booked at entry price {price}")
-            if self.close_by_signal(symbol, price, timestamp, reason):
-                closed.append(symbol)
+            try:
+                price = prices.get(symbol)
+                if price is None:
+                    row = self.positions_df[(self.positions_df['symbol'] == symbol) & (self.positions_df['status'] == 'OPEN')].iloc[0]
+                    price = float(row['entry_price'])
+                    logger.warning(f"No price for {symbol} at {reason}; paper exit booked at entry price {price}")
+                if self.close_by_signal(symbol, price, timestamp, reason):
+                    closed.append(symbol)
+            except Exception as e:
+                logger.error(f"close_all: {symbol} failed: {e}", exc_info=True)
+                failed.append(symbol)
+        if failed:
+            try:
+                self.notification_service.send_heartbeat_notification(
+                    message=f"⚠️ {reason} 全平時 {len(failed)} 檔出錯：{', '.join(failed)}，下個整點會再試，請確認交易所部位")
+            except Exception:
+                logger.exception("Heartbeat notification failed")
         return closed

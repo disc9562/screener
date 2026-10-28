@@ -139,7 +139,8 @@ def replay(data_dir, start, end, out_dir, breadth_on, kill, max_positions, notio
     pm._save_positions = lambda: None                         # 重播只在記憶體記帳（每筆進出場寫 CSV 在 Windows 會撞檔案鎖）
     live = ShotgunV3Live(fetcher, exclude_symbols=EXCLUDE_SYMBOLS, exclude_bases=NON_CRYPTO_BASES,
                          now_ms=lambda: fetcher.now, fetch_workers=1, rs_mode=RS_MODE,
-                         min_daily_quote_vol=MIN_DAILY_QUOTE_VOL, breadth_on=breadth_on)
+                         min_daily_quote_vol=MIN_DAILY_QUOTE_VOL, breadth_on=breadth_on,
+                         entry_requires_gate_now=kill)        # 原版 v3 preset 照原本慣例：23:00 那根只看前一天
     main._start_shadow = lambda fn: None                      # 影子記錄不在重播範圍
     cfg = {"NOTIONAL_PCT": notional, "DISASTER_STOP_PCT": 0.20, "MAX_POSITIONS": max_positions}
 

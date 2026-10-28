@@ -313,3 +313,35 @@ def test_price_for_prefers_latest_prices_then_last_close():
     live.refresh_breadth(T0)
     assert live.price_for("AAAUSDT") == 123.0 and live.price_for("ZZZUSDT") is None
 
+
+def test_price_for_uses_last_close_when_prices_are_stale():
+    """fetch_prices 連續失敗時 last_prices 會停在好幾小時前：超過 2 小時改用最新的 1h 收盤。"""
+    live, _ = _warm_aaa()
+    live.fetcher.prices = {"AAAUSDT": 123.0}
+    live.refresh_breadth(T0)
+    assert live.price_for("AAAUSDT", T0 + 2 * H) == 123.0
+    assert live.price_for("AAAUSDT", T0 + 2 * H + 1) == live.states["AAAUSDT"].closes[-1]
+    live.fetcher.prices = {"ZZZUSDT": 5.0}
+    live.refresh_breadth(T0)
+    assert live.price_for("ZZZUSDT", T0 + 3 * H) == 5.0                             # 沒有 1h 狀態 → 仍用舊價格
+
+
+def test_last_closed_bar_returns_the_bar_that_just_closed():
+    f = FakeFetcher()
+    f.k1h["AAAUSDT"] = _rows([1.0, 2.0, 3.0], T0 - 2 * H, H)                        # 開盤 T0-2H、T0-H、T0（還沒收完）
+    assert _live(f).last_closed_bar("AAAUSDT", T0) == (T0 - H, 2.0 * 1.01, 2.0 * 0.99, 2.0)
+
+
+def test_23h_bar_does_not_buy_after_the_gate_closed_at_midnight():
+    """00:00 依當天 BTC 旗標全平後，接著處理的 23:00 那根（v3 慣例屬前一天）不能再開倉；原版 v3 preset 照舊。"""
+    for requires, want in ((True, None), (False, "BUY")):
+        f = BreadthFetcher()
+        up = 100 * np.exp(np.cumsum(np.full(1500, 0.001)))
+        f.k1h["AAAUSDT"] = _rows(up[:-1], T0 - 1500 * H, H)                          # 最後一根開盤 T0 - 2H
+        live = ShotgunV3Live(f, now_ms=lambda: T0, entry_requires_gate_now=requires)
+        assert live.warmup("AAAUSDT")
+        live.days[pd.Timestamp(T0 - H, unit="ms").date()] = (frozenset({"AAAUSDT"}), True)  # 昨天：多頭、在名單
+        live.days[pd.Timestamp(T0, unit="ms").date()] = (frozenset(), False)               # 今天：BTC 跌破 EMA200
+        _breadth_on(live, T0, 0.8)
+        assert live.on_closed_kline("AAAUSDT", T0 - H, float(up[-1]), has_position=False) == want
+

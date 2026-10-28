@@ -225,3 +225,48 @@ def test_close_all_closes_every_position_with_reason(tmp_path):
     rows = pm.positions_df.set_index("symbol")
     assert (rows["exit_reason"] == "GATE_OFF_BTC").all()
     assert rows.loc["AAAUSDT", "pnl"] > 0 and rows.loc["BBBUSDT", "pnl"] < 0          # BBB 沒價格 → 用進場價，只剩手續費
+
+
+def test_close_all_keeps_going_when_one_symbol_fails(tmp_path, monkeypatch):
+    pm, notif = _pm(tmp_path)
+    ts = pd.Timestamp("2026-01-01")
+    pm.open_notional("AAAUSDT", 2.0, ts, 0.10, 0.20)
+    pm.open_notional("BBBUSDT", 1.0, ts, 0.10, 0.20)
+    real = pm.close_by_signal
+
+    def flaky(symbol, *a, **k):
+        if symbol == "AAAUSDT":
+            raise RuntimeError("boom")
+        return real(symbol, *a, **k)
+
+    monkeypatch.setattr(pm, "close_by_signal", flaky)
+    assert pm.close_all({"AAAUSDT": 2.2, "BBBUSDT": 1.1}, pd.Timestamp("2026-01-02"), "GATE_OFF_BTC") == ["BBBUSDT"]
+    assert pm.get_open_positions_symbols() == ["AAAUSDT"]                              # 下個整點會再平
+    assert "1 檔出錯：AAAUSDT" in notif.send_heartbeat_notification.call_args.kwargs["message"]
+
+
+def test_locked_csv_does_not_stop_closing(tmp_path, monkeypatch):
+    """Windows 上持倉檔被鎖住：存檔失敗只警示一次，紙上與交易所的平倉照常。"""
+    oes = MagicMock()
+    pm, notif = _pm(tmp_path, oes)
+    ts = pd.Timestamp("2026-01-01")
+    pm.open_notional("AAAUSDT", 2.0, ts, 0.10, 0.20)
+    pm.open_notional("BBBUSDT", 1.0, ts, 0.10, 0.20)
+
+    def locked(*a, **k):
+        raise PermissionError("positions.csv is locked")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", locked)
+    closed = pm.close_all({"AAAUSDT": 2.2, "BBBUSDT": 1.1}, pd.Timestamp("2026-01-02"), "GATE_OFF_BTC")
+    assert sorted(closed) == ["AAAUSDT", "BBBUSDT"] and oes.close_position.call_count == 2
+    assert len([c for c in notif.send_heartbeat_notification.call_args_list if "寫不進去" in str(c)]) == 1
+
+
+def test_close_alerts_when_exchange_position_was_already_stopped(tmp_path):
+    """交易所回 -2022（倉已經沒了，多半是災難止損先成交）→ 紙上照記，但發警示請核對成交價。"""
+    oes = MagicMock()
+    oes.close_position.return_value = {"status": "ALREADY_CLOSED", "symbol": "AAAUSDT"}
+    pm, notif = _pm(tmp_path, oes)
+    pm.open_notional("AAAUSDT", 2.0, pd.Timestamp("2026-01-01"), 0.10, 0.20)
+    pm.close_by_signal("AAAUSDT", 1.7, pd.Timestamp("2026-01-02"), "GATE_OFF_BREADTH")
+    assert any("交易所端已先平倉" in str(c) for c in notif.send_heartbeat_notification.call_args_list)

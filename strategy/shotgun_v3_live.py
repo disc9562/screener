@@ -17,6 +17,7 @@ MIN_BTC_DAYS = 1000
 DEFAULT_FETCH_WORKERS = 4
 BREADTH_4H_LIMIT = 130               # 每 4 小時更新寬度基準：120 根均線＋去掉還沒收完的那根
 BREADTH_MAX_AGE_MS = 2 * V.HOUR_MS   # 寬度讀數超過 2 小時沒更新 → 視為未知：不進新倉，也不據此平倉
+PRICE_MAX_AGE_MS = 2 * V.HOUR_MS     # 全市場價格超過 2 小時沒更新 → 平倉的紙上價格改用最新的 1h 收盤
 BREADTH_BASE_MAX_AGE_MS = 12 * V.HOUR_MS
 
 
@@ -42,7 +43,7 @@ def _dedup_sorted_rows(rows, cut_ms):
 class ShotgunV3Live:
     def __init__(self, fetcher, exclude_symbols=(), exclude_bases=(), now_ms=None, shadow_fetcher=None,
                  fetch_workers=DEFAULT_FETCH_WORKERS, rs_mode="alligator", min_daily_quote_vol=0.0,
-                 breadth_on=V.BREADTH_ON, breadth_min_daily_qv=V.BREADTH_MIN_DAILY_QV):
+                 breadth_on=V.BREADTH_ON, breadth_min_daily_qv=V.BREADTH_MIN_DAILY_QV, entry_requires_gate_now=True):
         self.fetcher = fetcher
         self.shadow_fetcher = shadow_fetcher or fetcher   # 影子記錄在背景執行緒，用獨立 client（限速額度仍共用）
         self.exclude_symbols = set(exclude_symbols)
@@ -53,6 +54,9 @@ class ShotgunV3Live:
         self.min_daily_quote_vol = float(min_daily_quote_vol)
         self.breadth_on = float(breadth_on)
         self.breadth_min_daily_qv = float(breadth_min_daily_qv)
+        # 進場時，處理當下的開關也不能是確定關掉（v3.1）。00:00 先依當天的 BTC 旗標全平，接著處理的 23:00 那根
+        # 依 v3 慣例用前一天的旗標；不擋的話會「全平後又開倉、01:00 再平」。False = 原版 v3 的慣例（重播的 v3 preset 用）
+        self.entry_requires_gate_now = bool(entry_requires_gate_now)
         self.days = {}                       # date -> (frozenset 名單, 是否多頭日)
         self.states = {}                     # symbol -> V.SymbolState
         self.rows_4h = {}                    # 最近一次換日抓到的 4h（影子記錄重用，不再多抓）
@@ -62,6 +66,7 @@ class ShotgunV3Live:
         self.breadth_value = None            # 最近一次寬度讀數
         self.breadth_ms = None               # 讀數時間
         self.last_prices = {}                # 最近一次全市場價格（平倉時當紙上價格用）
+        self.last_prices_ms = None           # 上面這組價格的抓取時間
 
     def _is_excluded(self, sym: str) -> bool:
         if sym in self.exclude_symbols:
@@ -168,7 +173,7 @@ class ShotgunV3Live:
         """每小時：全市場最新價格（一次請求）對照 20 日均線，更新寬度讀數。抓不到 → 保留舊讀數，回傳 None。"""
         prices = self.fetcher.fetch_prices() or {}
         if prices:
-            self.last_prices = prices
+            self.last_prices, self.last_prices_ms = prices, now_ms
         return self._set_breadth(prices, now_ms) if prices else None
 
     def breadth_now(self, now_ms):
@@ -196,12 +201,24 @@ class ShotgunV3Live:
             return "breadth"
         return None
 
-    def price_for(self, symbol):
-        """平倉用的紙上價格：最近一次全市場價格，沒有就用最後一根 1h 收盤。"""
-        if symbol in self.last_prices:
+    def price_for(self, symbol, now_ms=None):
+        """平倉用的紙上價格：2 小時內抓到的全市場價格；過期或沒有就用最後一根 1h 收盤；都沒有才用過期的全市場價格。"""
+        now_ms = self.now_ms() if now_ms is None else now_ms
+        fresh = self.last_prices_ms is not None and now_ms - self.last_prices_ms <= PRICE_MAX_AGE_MS
+        if fresh and symbol in self.last_prices:
             return float(self.last_prices[symbol])
         st = self.states.get(symbol)
-        return float(st.closes[-1]) if st is not None and len(st.closes) else None
+        if st is not None and len(st.closes):
+            return float(st.closes[-1])
+        return float(self.last_prices[symbol]) if symbol in self.last_prices else None
+
+    def last_closed_bar(self, symbol, now_ms):
+        """最近一根收完的 1h K 棒 (open_ms, high, low, close)，用 REST 抓；抓不到回 None。全平前的止損檢查用。"""
+        rows = _closed(self.fetcher.fetch_klines(symbol, "1h", 3) or [], now_ms)
+        if not rows:
+            return None
+        r = rows[-1]
+        return int(r[0]), float(r[2]), float(r[3]), float(r[4])
 
     def day_info(self, open_ms):
         return self.days.get(pd.Timestamp(open_ms, unit="ms").date(), (frozenset(), False))
@@ -243,7 +260,9 @@ class ShotgunV3Live:
         if has_position:
             return "SELL" if V.exit_signal(snap.s10, snap.s20) else None
         lst, bull = self.day_info(open_ms)
-        if (symbol in lst and V.gate_on(bull, self.breadth_now(self.now_ms()), self.breadth_on)
+        now_ms = self.now_ms()
+        if (symbol in lst and V.gate_on(bull, self.breadth_now(now_ms), self.breadth_on)
+                and not (self.entry_requires_gate_now and self.gate_off_reason(now_ms))
                 and V.entry_signal(snap.close, snap.s10, snap.s20, snap.s50, snap.s233, snap.er)):
             return "BUY"
         return None

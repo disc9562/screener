@@ -229,26 +229,72 @@ def report_gate(live, notification_service, now, previous):
     return state
 
 
+def _alert(notification_service, message):
+    """發 Discord 警示；通知本身失敗也只記 log。"""
+    try:
+        notification_service.send_heartbeat_notification(message=message)
+    except Exception:
+        logging.exception("Heartbeat notification failed")
+
+
 def hourly_gate(live, position_manager, notification_service, now, previous):
-    """整點：更新寬度 → 報告開關變化 → 開關確定關掉就全平。回傳目前開關狀態。"""
-    refresh_breadth(live, now)
-    state = report_gate(live, notification_service, now, previous)
-    enforce_gate(live, position_manager, notification_service, now)
+    """整點：更新寬度 → 報告開關變化 → 開關確定關掉就全平。回傳目前開關狀態。
+    每一步出錯（限速重試用完、持倉檔被鎖住）都只記 log，不讓主迴圈停掉（持倉照常監控）：
+    寬度保留舊讀數（2 小時後過期 → 不開新倉、不據此平倉），狀態維持上一個，全平下個整點再試。"""
+    try:
+        refresh_breadth(live, now)
+    except Exception as e:
+        logging.error(f"Breadth refresh failed at {now}: {e}", exc_info=True)
+    try:
+        state = report_gate(live, notification_service, now, previous)
+    except Exception as e:
+        logging.error(f"Gate report failed at {now}: {e}", exc_info=True)
+        state = previous
+    try:
+        enforce_gate(live, position_manager, notification_service, now)
+    except Exception as e:
+        logging.error(f"Gate enforcement failed at {now}: {e}", exc_info=True)
+        _alert(notification_service, f"⚠️ 大盤開關全平出錯，下個整點再試：{e}")
     return state
 
 
+def stop_check(live, position_manager, symbols, now):
+    """全平前先用剛收完的那根 1h（REST）跑紙上災難止損。那根低點已碰到止損的倉，交易所的 STOP_MARKET 多半已成交：
+    照止損價記 STOP_LOSS，不記成開關平倉（否則紙上 PnL 比交易所好，之後的下單權益會一直偏掉）。回傳止損掉的幣。"""
+    now_ms = int(now.value // 1_000_000)
+    bars = {}
+    for s in symbols:
+        try:
+            bar = live.last_closed_bar(s, now_ms)
+            if bar is None:
+                continue
+            open_ms, high, low, close = bar
+        except Exception as e:
+            logging.warning(f"Stop check: last 1h bar of {s} unavailable: {e}")
+            continue
+        bars[s] = pd.Series({'Datetime': pd.Timestamp(open_ms, unit='ms') + pd.Timedelta(hours=1),
+                             'High': high, 'Low': low, 'Close': close})
+    if bars:
+        position_manager.update_positions(bars)
+    return sorted(set(symbols) - set(position_manager.get_open_positions_symbols()))
+
+
 def enforce_gate(live, position_manager, notification_service, now):
-    """開關確定關掉（BTC 日線跌破 EMA200，或寬度 < 門檻）→ 全部持倉市價平倉。資料缺漏不算關掉。"""
-    reason = live.gate_off_reason(int(now.value // 1_000_000))
+    """開關確定關掉（BTC 日線跌破 EMA200，或寬度 < 門檻）→ 先跑止損檢查，剩下的持倉全部市價平倉。資料缺漏不算關掉。"""
+    now_ms = int(now.value // 1_000_000)
+    reason = live.gate_off_reason(now_ms)
     open_symbols = position_manager.get_open_positions_symbols()
     if reason is None or not open_symbols:
         return []
-    prices = {s: live.price_for(s) for s in open_symbols}
+    stopped = stop_check(live, position_manager, open_symbols, now)
+    remaining = position_manager.get_open_positions_symbols()
+    prices = {s: live.price_for(s, now_ms) for s in remaining}
     closed = position_manager.close_all({s: p for s, p in prices.items() if p is not None}, now, f"GATE_OFF_{reason.upper()}")
-    logging.info(f"Gate off ({reason}): closed {closed}")
-    notification_service.send_heartbeat_notification(
-        message=f"⚠️ 大盤開關關閉（{'BTC 日線跌破 EMA200' if reason == 'btc' else f'寬度 < {live.breadth_on:.0%}'}），"
-                f"全部平倉 {len(closed)} 檔：{', '.join(closed)}")
+    logging.info(f"Gate off ({reason}): closed {closed}, stopped before close-all {stopped}")
+    _alert(notification_service,
+           f"⚠️ 大盤開關關閉（{'BTC 日線跌破 EMA200' if reason == 'btc' else f'寬度 < {live.breadth_on:.0%}'}），"
+           f"全部平倉 {len(closed)} 檔：{', '.join(closed)}"
+           + (f"；另有 {len(stopped)} 檔上一根已碰到災難止損，照止損價記帳：{', '.join(stopped)}" if stopped else ""))
     return closed
 
 
@@ -336,22 +382,26 @@ def run_app(args):
     ws.start(symbols=sorted(subscribed), interval='1h')
     try:
         while True:
-            message = ws.get_message(block=True, timeout=1)
-            now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-            if now >= cutoff and now >= retry_at:
-                if rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
-                    cutoff = next_cutoff(now)
-                else:
-                    retry_at = now + REBALANCE_RETRY
-            if now.floor("h") > breadth_hour:                  # 先更新寬度與開關，再處理這個整點收完的 K 棒
-                gate = hourly_gate(live, position_manager, notification_service, now, gate)
-                breadth_hour = now.floor("h")
-            if message:
-                batch, others = collect_batch(ws, message, subscribed)
-                handle_batch(batch, live, position_manager, cfg)
-                if others:
-                    handle_batch(others, live, position_manager, cfg)
-                subscribe_open_positions(ws, position_manager, subscribed)
+            try:
+                message = ws.get_message(block=True, timeout=1)
+                now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+                if now >= cutoff and now >= retry_at:
+                    if rollover(live, position_manager, ws, notification_service, cutoff, subscribed):
+                        cutoff = next_cutoff(now)
+                    else:
+                        retry_at = now + REBALANCE_RETRY
+                if now.floor("h") > breadth_hour:              # 先更新寬度與開關，再處理這個整點收完的 K 棒
+                    gate = hourly_gate(live, position_manager, notification_service, now, gate)
+                    breadth_hour = now.floor("h")
+                if message:
+                    batch, others = collect_batch(ws, message, subscribed)
+                    handle_batch(batch, live, position_manager, cfg)
+                    if others:
+                        handle_batch(others, live, position_manager, cfg)
+                    subscribe_open_positions(ws, position_manager, subscribed)
+            except Exception as e:                             # 任何沒預料到的錯都不能讓 bot 退出（持倉會沒人監控）
+                logging.error(f"Main loop error: {e}", exc_info=True)
+                time.sleep(1)
     except KeyboardInterrupt:
         logging.info("Keyboard interrupt received.")
     finally:

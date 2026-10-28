@@ -214,7 +214,8 @@ def test_enforce_gate_closes_everything_when_gate_is_off():
     live, pm, notif = MagicMock(), MagicMock(), MagicMock()
     live.gate_off_reason.return_value = "breadth"
     live.breadth_on = 0.5
-    live.price_for.side_effect = {"AAAUSDT": 2.0, "BBBUSDT": None}.get
+    live.last_closed_bar.return_value = None
+    live.price_for.side_effect = lambda s, now_ms: {"AAAUSDT": 2.0, "BBBUSDT": None}[s]
     pm.get_open_positions_symbols.return_value = ["AAAUSDT", "BBBUSDT"]
     pm.close_all.return_value = ["AAAUSDT", "BBBUSDT"]
     now = pd.Timestamp("2026-01-02 05:00:01")
@@ -222,6 +223,7 @@ def test_enforce_gate_closes_everything_when_gate_is_off():
     prices, ts, reason = pm.close_all.call_args.args
     assert prices == {"AAAUSDT": 2.0} and ts == now and reason == "GATE_OFF_BREADTH"
     assert live.gate_off_reason.call_args.args == (_ms("2026-01-02 05:00:01"),)
+    assert live.price_for.call_args.args[1] == _ms("2026-01-02 05:00:01")             # 價格新舊照現在判斷
     assert "全部平倉 2 檔" in notif.send_heartbeat_notification.call_args.kwargs["message"]
 
 
@@ -318,3 +320,39 @@ def test_hourly_gate_refreshes_then_reports_then_enforces():
     pm.get_open_positions_symbols.return_value = []
     assert main.hourly_gate(live, pm, notif, pd.Timestamp("2026-01-02 05:00:01"), "on") == "off"
     assert order == ["refresh", "report", "enforce"]
+
+
+def test_hourly_gate_keeps_running_when_steps_fail():
+    """限速重試用完、持倉檔被鎖住 → 記 log、維持上一個狀態，不能往外丟（主迴圈只接 KeyboardInterrupt，bot 會退出）。"""
+    live, pm, notif = MagicMock(), MagicMock(), MagicMock()
+    live.days, live.breadth_on, live.breadth_smas, live.breadth_base_ms = {}, 0.5, {}, None
+    live.refresh_breadth_base.side_effect = RuntimeError("RetryError: 429")
+    live.gate_state.side_effect = RuntimeError("boom")
+    live.gate_off_reason.return_value = "btc"
+    live.last_closed_bar.return_value = None
+    pm.get_open_positions_symbols.return_value = ["AAAUSDT"]
+    pm.close_all.side_effect = PermissionError("positions.csv is locked")
+    assert main.hourly_gate(live, pm, notif, pd.Timestamp("2026-01-02 05:00:01"), "on") == "on"
+    pm.close_all.assert_called_once()                        # 寬度更新失敗，不影響 BTC 確定關掉時的全平
+    assert "下個整點再試" in notif.send_heartbeat_notification.call_args.kwargs["message"]
+
+
+def test_enforce_gate_books_stops_before_closing_the_rest(tmp_path):
+    """上一根低點已碰到災難止損的倉（交易所 STOP_MARKET 多半已成交）照止損價記 STOP_LOSS，其餘才記開關平倉。"""
+    from services.position_manager import PositionManager
+    notif = MagicMock()
+    pm = PositionManager(notif, {"TOTAL_CAPITAL": 10000.0, "TRANSACTION_FEE_PERCENT": 0.0005}, str(tmp_path / "p.csv"))
+    ts = pd.Timestamp("2026-01-02 03:00")
+    pm.open_notional("AAAUSDT", 1.0, ts, 0.10, 0.20)                                   # 止損 0.8
+    pm.open_notional("BBBUSDT", 1.0, ts, 0.10, 0.20)
+    live = MagicMock()
+    live.breadth_on = 0.5
+    live.gate_off_reason.return_value = "breadth"
+    bars = {"AAAUSDT": (_ms("2026-01-02 04:00"), 1.0, 0.79, 0.82), "BBBUSDT": (_ms("2026-01-02 04:00"), 1.0, 0.9, 0.95)}
+    live.last_closed_bar.side_effect = lambda s, now_ms: bars[s]
+    live.price_for.side_effect = lambda s, now_ms: {"AAAUSDT": 0.82, "BBBUSDT": 0.95}[s]
+    assert main.enforce_gate(live, pm, notif, pd.Timestamp("2026-01-02 05:00:01")) == ["BBBUSDT"]
+    rows = pm.positions_df.set_index("symbol")
+    assert rows.loc["AAAUSDT", "exit_reason"] == "STOP_LOSS" and rows.loc["BBBUSDT", "exit_reason"] == "GATE_OFF_BREADTH"
+    assert live.last_closed_bar.call_args.args[1] == _ms("2026-01-02 05:00:01")
+    assert "另有 1 檔" in notif.send_heartbeat_notification.call_args.kwargs["message"]
