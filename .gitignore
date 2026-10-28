@@ -9,3 +9,4 @@ __pycache__/
 output.txt
 data/backtest_cache/
 
+autoresearch/runs/
